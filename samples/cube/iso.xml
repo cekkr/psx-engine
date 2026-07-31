@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<iso_project>
+  <track type="data">
+    <identifiers
+      system="PLAYSTATION"
+      volume="PSXE_CUBE"
+      volume_set="PSXE_SAMPLES"
+      publisher="PSX_ENGINE"
+      data_preparer="PSN00BSDK ${PSN00BSDK_VERSION}"
+      application="PLAYSTATION"
+      copyright="LICENSE.TXT;1"
+    />
+    <directory_tree>
+      <file name="SYSTEM.CNF" type="data" source="${PROJECT_SOURCE_DIR}/samples/cube/system.cnf" />
+      <file name="PSXE_CUB.EXE" type="data" source="psxe_cube.exe" />
+      <file name="README.TXT" type="data" source="${PROJECT_SOURCE_DIR}/README.md" />
+      <file name="LICENSE.TXT" type="data" source="${PROJECT_SOURCE_DIR}/LICENSE" />
+      <dummy sectors="256" />
+    </directory_tree>
+  </track>
+</iso_project>
