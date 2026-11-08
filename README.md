@@ -102,6 +102,8 @@ overwritten.
   all generated target libraries, SDK tools, and compiler files.
 - [`ROADMAP.md`](ROADMAP.md) separates current scaffolding from the work needed
   for production-sized games.
+- [`APIs.md`](APIs.md) lists every public function with snippets and recipes
+  that combine subsystems.
 - [`AGENTS.md`](AGENTS.md) is the operational and architecture reference for
   contributors and coding agents.
 

@@ -370,6 +370,13 @@ User-facing mission, current feature boundary, macOS workflow, programming
 model, sample controls, influences, and safety/status notes. It must not claim a
 ROADMAP feature is implemented.
 
+### [`APIs.md`](APIs.md)
+
+Game-developer reference for every public header symbol, with per-function
+snippets and multi-subsystem recipes. Update it in the same change as any public
+header or observable behavior change; it must describe the checked-out code, not
+roadmap intent. Its recipes are compile-checked only, not runtime-tested.
+
 ### [`ROADMAP.md`](ROADMAP.md)
 
 Authoritative phased backlog and architecture direction. Check off work only
