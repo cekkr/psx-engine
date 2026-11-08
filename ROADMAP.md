@@ -101,13 +101,47 @@ loads without runtime parsing of source formats.
   ordering-table ranges/layers, and packet-budget reservation.
 - [ ] Clip triangles against the near plane and viewport; add optional adaptive
   subdivision for large affine-textured polygons to reduce warping and popping.
-- [ ] Add flat/Gouraud vertex color and lighting, multiple directional lights,
-  ambient light, GTE depth cueing/fog, emissive/unlit materials, and selectable
-  semi-transparency modes.
+- [ ] Add flat/Gouraud vertex color and lighting, GTE depth cueing/fog,
+  emissive materials, and selectable semi-transparency modes (multiple lights
+  and ambient are covered by the light-object work below).
+- [ ] Light objects and scene lighting. Today the renderer holds one global
+  directional light (row 0 of the GTE light/color matrices plus back color) set
+  by `psxe_renderer_set_directional_light`, scene entities cannot own lights,
+  and render-target passes do not save/restore light state.
+  - [ ] Add a public `psxe_light` value type (directional, point, ambient) with
+    color, intensity in 20.12 fixed point, enabled flag, and for point lights
+    world position, falloff radius, and an explicit attenuation curve; add
+    `psxe_light_*` init/setter helpers that never touch GTE state.
+  - [ ] Add a fixed-capacity light set (`PSXE_MAX_LIGHTS` in `config.h`) owned
+    by the renderer or scene, plus `psxe_renderer_set_lights`/ambient APIs that
+    fill all three GTE light-matrix rows and color-matrix columns; keep
+    `psxe_renderer_set_directional_light` as a one-light wrapper.
+  - [ ] Define per-mesh light selection: rank enabled lights by contribution at
+    the object's origin/bounds, fold the best three into the GTE rows, convert
+    point lights to object-local directions with CPU-side distance attenuation,
+    and accumulate the rest into back color. Re-establish this state per mesh
+    per the GTE global-state contract; record the selection cost in CPU ticks.
+  - [ ] Let scene entities carry an optional light (`psxe_scene_set_light`,
+    enable/disable, follow the entity transform) so `psxe_scene_render` gathers
+    active visible lights before submitting meshes; stale entity handles must
+    not leave dangling lights, and exhaustion must fail or count drops.
+  - [ ] Add per-material/per-entity light masks or layers so UI-adjacent,
+    emissive, or `PSXE_EFFECT_UNLIT` geometry can ignore selected lights without
+    extra GTE work.
+  - [ ] Save and restore light state across `psxe_render_target_begin`/`end` and
+    allow a pass to supply its own light set.
+  - [ ] Optional debug draw for light positions/radii and an on-screen counter
+    for lights considered, applied, and dropped per frame.
+  - [ ] Extend the cube sample (or a dedicated lights sample) with a moving point
+    light entity, a static directional light, and ambient changes; capture
+    PCSX-Redux/DuckStation frames and measure flat versus Gouraud cost.
+  - [ ] Update `APIs.md`, `README.md`, and `AGENTS.md` ownership/contract
+    sections when the API lands; vertex-accurate per-vertex point lighting and
+    shadows remain out of scope until profiling justifies them.
 - [ ] Add textured quads, billboards, nine-slice UI, tile maps, sprite sheets,
   sprite rotation, sprite animation, particles, trails, decals,
   sky/background layers, and render-target extensions (paletted/8-bit
-  targets, double buffering, VRAM-allocator integration, light save/restore).
+  targets, double buffering, VRAM-allocator integration).
 - [ ] Add rigid-part and keyframed vertex animation first; evaluate limited
   skinning only after profiling memory and GTE cost.
 - [ ] Add LOD groups, portal/room visibility, occlusion hints, and offline
