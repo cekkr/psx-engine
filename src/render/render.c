@@ -5,7 +5,9 @@
 
 #include <inline_c.h>
 
-static void *psxe_renderer_allocate(psxe_renderer *renderer, size_t size) {
+#include "render_internal.h"
+
+void *psxe_renderer_allocate(psxe_renderer *renderer, size_t size) {
     uintptr_t current = (uintptr_t)renderer->next_packet;
     uintptr_t aligned = (current + 3u) & ~(uintptr_t)3u;
     uint8_t *result = (uint8_t *)aligned;
@@ -19,11 +21,34 @@ static void *psxe_renderer_allocate(psxe_renderer *renderer, size_t size) {
     return result;
 }
 
-static uint32_t *psxe_renderer_ui_bucket(psxe_renderer *renderer, unsigned int layer) {
-    if (layer >= PSXE_OT_LENGTH) {
-        layer = 0;
+uint32_t *psxe_renderer_bucket(psxe_renderer *renderer, unsigned int layer) {
+    if (layer >= renderer->ot_length) {
+        layer = (unsigned int)renderer->ot_length - 1u;
     }
-    return &renderer->buffers[renderer->active_buffer].ordering_table[layer];
+    return &renderer->ordering_table[layer];
+}
+
+static psxe_color psxe_resolve_color(psxe_color face, const psxe_material *material) {
+    psxe_color result = face;
+    unsigned int r;
+    unsigned int g;
+    unsigned int b;
+
+    if (material == NULL) {
+        return result;
+    }
+    if (material->color_mode == PSXE_COLOR_REPLACE) {
+        return material->color;
+    }
+    if (material->color_mode == PSXE_COLOR_TINT) {
+        r = ((unsigned int)face.r * material->color.r) >> 7;
+        g = ((unsigned int)face.g * material->color.g) >> 7;
+        b = ((unsigned int)face.b * material->color.b) >> 7;
+        result.r = (uint8_t)((r > 255u) ? 255u : r);
+        result.g = (uint8_t)((g > 255u) ? 255u : g);
+        result.b = (uint8_t)((b > 255u) ? 255u : b);
+    }
+    return result;
 }
 
 static void psxe_make_object_matrix(
@@ -69,6 +94,7 @@ void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *confi
     renderer->height = config->height;
     renderer->depth_shift = 2;
     renderer->camera = default_camera;
+    renderer->dither = config->dither;
 
     ResetGraph(0);
     SetVideoMode((config->video_mode == PSXE_VIDEO_PAL) ? MODE_PAL : MODE_NTSC);
@@ -90,6 +116,8 @@ void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *confi
     renderer->active_buffer = 0;
     renderer->next_packet = first->packets;
     renderer->packet_end = first->packets + sizeof(first->packets);
+    renderer->ordering_table = first->ordering_table;
+    renderer->ot_length = PSXE_OT_LENGTH;
     ClearOTagR(first->ordering_table, PSXE_OT_LENGTH);
 
     InitGeom();
@@ -108,11 +136,15 @@ void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *confi
 void psxe_renderer_begin_frame(psxe_renderer *renderer) {
     renderer->submitted_primitives = 0;
     renderer->dropped_primitives = 0;
+    renderer->target_passes = 0;
 }
 
 void psxe_renderer_end_frame(psxe_renderer *renderer) {
     psxe_render_buffer *draw_buffer;
     psxe_render_buffer *display_buffer;
+
+    /* A render-target pass left open is closed so its chain is terminated. */
+    psxe_render_target_end(renderer);
 
     DrawSync(0);
     VSync(0);
@@ -120,11 +152,21 @@ void psxe_renderer_end_frame(psxe_renderer *renderer) {
     draw_buffer = &renderer->buffers[renderer->active_buffer];
     display_buffer = &renderer->buffers[renderer->active_buffer ^ 1];
     PutDispEnv(&display_buffer->display);
-    DrawOTagEnv(&draw_buffer->ordering_table[PSXE_OT_LENGTH - 1], &draw_buffer->draw);
+    if (renderer->pass_head != NULL) {
+        /* Offscreen passes execute first, then the main ordering table. */
+        setaddr(renderer->pass_tail, &draw_buffer->ordering_table[PSXE_OT_LENGTH - 1]);
+        DrawOTagEnv((const uint32_t *)renderer->pass_head, &draw_buffer->draw);
+    } else {
+        DrawOTagEnv(&draw_buffer->ordering_table[PSXE_OT_LENGTH - 1], &draw_buffer->draw);
+    }
+    renderer->pass_head = NULL;
+    renderer->pass_tail = NULL;
 
     renderer->active_buffer ^= 1;
     renderer->next_packet = display_buffer->packets;
     renderer->packet_end = display_buffer->packets + sizeof(display_buffer->packets);
+    renderer->ordering_table = display_buffer->ordering_table;
+    renderer->ot_length = PSXE_OT_LENGTH;
     ClearOTagR(display_buffer->ordering_table, PSXE_OT_LENGTH);
 }
 
@@ -181,10 +223,11 @@ bool psxe_texture_load_tim(psxe_texture *texture, const uint32_t *tim_data) {
         texture->u = (uint8_t)((image.prect->x & 63) * 4);
         texture->width = (uint16_t)(image.prect->w * 4);
     } else if (mode == 1) {
-        texture->u = (uint8_t)((image.prect->x & 127) * 2);
+        texture->u = (uint8_t)((image.prect->x & 63) * 2);
         texture->width = (uint16_t)(image.prect->w * 2);
     } else {
-        texture->u = (uint8_t)(image.prect->x & 255);
+        /* 16-bit pages start every 64 halfwords; u is the offset inside it. */
+        texture->u = (uint8_t)(image.prect->x & 63);
         texture->width = (uint16_t)image.prect->w;
     }
     texture->height = (uint16_t)image.prect->h;
@@ -197,14 +240,41 @@ void psxe_draw_mesh(
     const psxe_mesh *mesh,
     const psxe_transform *transform
 ) {
+    psxe_draw_mesh_material(renderer, mesh, transform, NULL);
+}
+
+void psxe_draw_mesh_material(
+    psxe_renderer *renderer,
+    const psxe_mesh *mesh,
+    const psxe_transform *transform,
+    const psxe_material *material
+) {
     MATRIX object_rotation;
     MATRIX view_object;
     MATRIX object_light;
+    const psxe_texture *texture;
+    uint8_t effects = 0;
+    uint8_t blend = PSXE_BLEND_HALF;
+    uint16_t tpage = 0;
+    bool can_texture;
     uint16_t face_index;
 
     if ((renderer == NULL) || (mesh == NULL) || (transform == NULL) ||
         (mesh->vertices == NULL) || (mesh->faces == NULL)) {
         return;
+    }
+
+    texture = mesh->texture;
+    if (material != NULL) {
+        effects = material->effects;
+        blend = (uint8_t)(material->blend & 3u);
+        if (material->texture != NULL) {
+            texture = material->texture;
+        }
+    }
+    can_texture = (texture != NULL) && texture->valid && !(effects & PSXE_EFFECT_UNTEXTURED);
+    if (can_texture) {
+        tpage = psxe_tpage_with_blend(texture->tpage, blend);
     }
 
     psxe_make_object_matrix(renderer, transform, &object_rotation, &view_object);
@@ -215,11 +285,15 @@ void psxe_draw_mesh(
 
     for (face_index = 0; face_index < mesh->face_count; ++face_index) {
         const psxe_face *face = &mesh->faces[face_index];
+        uint8_t flags = face->flags;
+        psxe_color color;
         int32_t winding;
         int32_t average_z;
         int depth;
         bool textured;
         bool lit;
+        bool semitransparent;
+        uint32_t *bucket;
 
         if ((face->vertex[0] >= mesh->vertex_count) ||
             (face->vertex[1] >= mesh->vertex_count) ||
@@ -236,7 +310,8 @@ void psxe_draw_mesh(
         gte_rtpt();
         gte_nclip();
         gte_stopz(&winding);
-        if (!(face->flags & PSXE_MATERIAL_DOUBLE_SIDED) && (winding <= 0)) {
+        if (!(flags & PSXE_MATERIAL_DOUBLE_SIDED) && !(effects & PSXE_EFFECT_DOUBLE_SIDED) &&
+            (winding <= 0)) {
             continue;
         }
 
@@ -244,14 +319,17 @@ void psxe_draw_mesh(
         gte_stotz(&average_z);
         depth = average_z >> renderer->depth_shift;
         /* Buckets 0 and 1 are reserved for text and 2D primitives. */
-        if ((depth <= 1) || (depth >= PSXE_OT_LENGTH)) {
+        if ((depth <= 1) || (depth >= (int)renderer->ot_length)) {
             continue;
         }
+        bucket = &renderer->ordering_table[depth];
 
-        textured = (face->flags & PSXE_MATERIAL_TEXTURED) &&
-                   (mesh->texture != NULL) && mesh->texture->valid;
-        lit = (face->flags & PSXE_MATERIAL_LIT) &&
+        textured = can_texture && (flags & PSXE_MATERIAL_TEXTURED);
+        lit = (flags & PSXE_MATERIAL_LIT) && !(effects & PSXE_EFFECT_UNLIT) &&
               (mesh->normals != NULL) && (face->normal < mesh->normal_count);
+        semitransparent = (flags & PSXE_MATERIAL_SEMITRANSPARENT) ||
+                          (effects & PSXE_EFFECT_SEMITRANSPARENT);
+        color = psxe_resolve_color(face->color, material);
 
         if (textured) {
             POLY_FT3 *primitive = psxe_renderer_allocate(renderer, sizeof(*primitive));
@@ -259,35 +337,49 @@ void psxe_draw_mesh(
                 continue;
             }
             setPolyFT3(primitive);
-            setRGB0(primitive, face->color.r, face->color.g, face->color.b);
+            setRGB0(primitive, color.r, color.g, color.b);
             gte_stsxy0(&primitive->x0);
             gte_stsxy1(&primitive->x1);
             gte_stsxy2(&primitive->x2);
-            primitive->u0 = (uint8_t)(mesh->texture->u + face->uv[0][0]);
-            primitive->v0 = (uint8_t)(mesh->texture->v + face->uv[0][1]);
-            primitive->u1 = (uint8_t)(mesh->texture->u + face->uv[1][0]);
-            primitive->v1 = (uint8_t)(mesh->texture->v + face->uv[1][1]);
-            primitive->u2 = (uint8_t)(mesh->texture->u + face->uv[2][0]);
-            primitive->v2 = (uint8_t)(mesh->texture->v + face->uv[2][1]);
-            primitive->tpage = mesh->texture->tpage;
-            primitive->clut = mesh->texture->clut;
+            primitive->u0 = (uint8_t)(texture->u + face->uv[0][0]);
+            primitive->v0 = (uint8_t)(texture->v + face->uv[0][1]);
+            primitive->u1 = (uint8_t)(texture->u + face->uv[1][0]);
+            primitive->v1 = (uint8_t)(texture->v + face->uv[1][1]);
+            primitive->u2 = (uint8_t)(texture->u + face->uv[2][0]);
+            primitive->v2 = (uint8_t)(texture->v + face->uv[2][1]);
+            /* The textured primitive carries its own page and blend mode. */
+            primitive->tpage = tpage;
+            primitive->clut = texture->clut;
             if (lit) {
                 gte_ldrgb(&primitive->r0);
                 gte_ldv0(&mesh->normals[face->normal]);
                 gte_nccs();
                 gte_strgb(&primitive->r0);
             }
-            if (face->flags & PSXE_MATERIAL_SEMITRANSPARENT) {
+            if (semitransparent) {
                 setSemiTrans(primitive, 1);
             }
-            addPrim(&renderer->buffers[renderer->active_buffer].ordering_table[depth], primitive);
+            addPrim(bucket, primitive);
+            ++renderer->submitted_primitives;
         } else {
-            POLY_F3 *primitive = psxe_renderer_allocate(renderer, sizeof(*primitive));
+            POLY_F3 *primitive;
+            DR_TPAGE *page = NULL;
+
+            /* Untextured primitives blend with the GPU's current ABR bits, so
+             * a state packet must execute first. Reserve it before the face so
+             * an exhausted arena drops the whole face instead of mis-blending. */
+            if (semitransparent) {
+                page = psxe_renderer_allocate(renderer, sizeof(*page));
+                if (page == NULL) {
+                    continue;
+                }
+            }
+            primitive = psxe_renderer_allocate(renderer, sizeof(*primitive));
             if (primitive == NULL) {
                 continue;
             }
             setPolyF3(primitive);
-            setRGB0(primitive, face->color.r, face->color.g, face->color.b);
+            setRGB0(primitive, color.r, color.g, color.b);
             gte_stsxy0(&primitive->x0);
             gte_stsxy1(&primitive->x1);
             gte_stsxy2(&primitive->x2);
@@ -297,50 +389,19 @@ void psxe_draw_mesh(
                 gte_nccs();
                 gte_strgb(&primitive->r0);
             }
-            if (face->flags & PSXE_MATERIAL_SEMITRANSPARENT) {
+            if (semitransparent) {
                 setSemiTrans(primitive, 1);
             }
-            addPrim(&renderer->buffers[renderer->active_buffer].ordering_table[depth], primitive);
+            addPrim(bucket, primitive);
+            ++renderer->submitted_primitives;
+            if (page != NULL) {
+                /* addPrim prepends: inserted after, executes before. */
+                setDrawTPage(page, 0, renderer->dither ? 1 : 0, getTPage(0, blend, 0, 0));
+                addPrim(bucket, page);
+                ++renderer->submitted_primitives;
+            }
         }
-        ++renderer->submitted_primitives;
     }
-}
-
-void psxe_draw_sprite(
-    psxe_renderer *renderer,
-    const psxe_texture *texture,
-    int16_t x,
-    int16_t y,
-    int16_t width,
-    int16_t height,
-    psxe_color tint,
-    bool semitransparent
-) {
-    SPRT *sprite;
-    DR_TPAGE *page;
-    uint32_t *bucket;
-
-    if ((renderer == NULL) || (texture == NULL) || !texture->valid || (width <= 0) || (height <= 0)) {
-        return;
-    }
-    sprite = psxe_renderer_allocate(renderer, sizeof(*sprite));
-    page = psxe_renderer_allocate(renderer, sizeof(*page));
-    if ((sprite == NULL) || (page == NULL)) {
-        return;
-    }
-
-    bucket = psxe_renderer_ui_bucket(renderer, 1);
-    setSprt(sprite);
-    setXY0(sprite, x, y);
-    setWH(sprite, width, height);
-    setUV0(sprite, texture->u, texture->v);
-    setRGB0(sprite, tint.r, tint.g, tint.b);
-    sprite->clut = texture->clut;
-    setSemiTrans(sprite, semitransparent ? 1 : 0);
-    addPrim(bucket, sprite);
-    setDrawTPage(page, 0, semitransparent ? 1 : 0, texture->tpage);
-    addPrim(bucket, page);
-    renderer->submitted_primitives += 2;
 }
 
 void psxe_ui_panel(
@@ -372,11 +433,11 @@ void psxe_ui_panel(
     setWH(tile, width, height);
     setRGB0(tile, color.r, color.g, color.b);
     setSemiTrans(tile, semitransparent ? 1 : 0);
-    addPrim(psxe_renderer_ui_bucket(renderer, 1), tile);
+    addPrim(psxe_renderer_bucket(renderer, 1), tile);
     ++renderer->submitted_primitives;
     if (page != NULL) {
-        setDrawTPage(page, 0, 1, getTPage(0, 0, 0, 0));
-        addPrim(psxe_renderer_ui_bucket(renderer, 1), page);
+        setDrawTPage(page, 0, renderer->dither ? 1 : 0, getTPage(0, PSXE_BLEND_HALF, 0, 0));
+        addPrim(psxe_renderer_bucket(renderer, 1), page);
         ++renderer->submitted_primitives;
     }
 }
@@ -395,6 +456,6 @@ void psxe_ui_text(psxe_renderer *renderer, int16_t x, int16_t y, const char *tex
     if (start == NULL) {
         return;
     }
-    renderer->next_packet = (uint8_t *)FntSort(psxe_renderer_ui_bucket(renderer, 0), start, x, y, text);
+    renderer->next_packet = (uint8_t *)FntSort(psxe_renderer_bucket(renderer, 0), start, x, y, text);
     renderer->submitted_primitives += (uint32_t)length + 1u;
 }

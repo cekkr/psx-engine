@@ -38,6 +38,9 @@ behavior.
 - [x] Fixed-capacity engine loop, scene entities, GTE triangle renderer,
   ordering table, colored/textured material path, directional lighting,
   dithering, sprites, panels, and debug text.
+- [x] Material overrides (texture swap, replace/tint color, unlit, untextured,
+  blend modes), `psxe_object`/`psxe_sprite` structs with atlas regions,
+  scaling, flipping, and layers, and single-buffered render-to-texture passes.
 - [x] Two-port pad snapshots with held/pressed/released states and analog axes.
 - [x] In-memory VAG upload and 24-channel SPU playback.
 - [x] Versioned, CRC-protected, one-block memory-card save/load API.
@@ -102,8 +105,9 @@ loads without runtime parsing of source formats.
   ambient light, GTE depth cueing/fog, emissive/unlit materials, and selectable
   semi-transparency modes.
 - [ ] Add textured quads, billboards, nine-slice UI, tile maps, sprite sheets,
-  sprite animation, particles, trails, decals, sky/background layers, and
-  render-to-texture where budgets permit.
+  sprite rotation, sprite animation, particles, trails, decals,
+  sky/background layers, and render-target extensions (paletted/8-bit
+  targets, double buffering, VRAM-allocator integration, light save/restore).
 - [ ] Add rigid-part and keyframed vertex animation first; evaluate limited
   skinning only after profiling memory and GTE cost.
 - [ ] Add LOD groups, portal/room visibility, occlusion hints, and offline

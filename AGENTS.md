@@ -85,16 +85,38 @@ silently simulate faster/slower without an explicit game policy.
 ## Critical Implementation Contracts
 
 - **Packet arena:** `psxe_renderer_allocate` in
-  [`src/render/render.c`](src/render/render.c) is the only allocator for target
-  GPU packets. It aligns to four bytes, checks `packet_end`, and increments
-  `dropped_primitives` on failure. Every draw path must handle `NULL`.
-- **Ordering-table lifetime:** draw functions add packets only to the active
-  buffer. `psxe_renderer_end_frame` waits for GPU/vblank, submits that buffer,
-  switches buffers, resets the packet pointer, and clears only the next table.
-  Reusing packets before `DrawSync` corrupts the in-flight display list.
+  [`src/render/render.c`](src/render/render.c) (declared for the renderer
+  translation units in [`src/render/render_internal.h`](src/render/render_internal.h))
+  is the only allocator for target GPU packets. It aligns to four bytes, checks
+  `packet_end`, and increments `dropped_primitives` on failure. Every draw path
+  must handle `NULL`; a path that needs a state packet plus a primitive must
+  reserve both before linking either, so exhaustion drops instead of drawing
+  with the wrong GPU state.
+- **Ordering-table lifetime:** draw functions add packets only to
+  `renderer->ordering_table`/`ot_length`, which is the active buffer's table or,
+  during a render-target pass, a table allocated from the active packet arena.
+  Use `psxe_renderer_bucket`, never `buffers[...]` directly.
+  `psxe_renderer_end_frame` closes an open pass, waits for GPU/vblank, submits
+  the pass chain then that buffer, switches buffers, resets the packet pointer
+  and destination table, and clears only the next table. Reusing packets before
+  `DrawSync` corrupts the in-flight display list.
 - **Depth direction:** bucket zero is frontmost text, bucket one is sprites and
   panels, and larger buckets render earlier/farther. Mesh depth derived from
-  `gte_avsz3` must be rejected outside `[2, PSXE_OT_LENGTH)` before indexing.
+  `gte_avsz3` must be rejected outside `[2, renderer->ot_length)` before
+  indexing. Sprite `layer` values clamp to the last bucket.
+- **Render-target chain:** [`src/render/target.c`](src/render/target.c) builds
+  `enter DR_ENV → target OT → bucket 0 → leave DR_ENV` per pass; `leave` is
+  inserted into bucket 0 immediately after `ClearOTagR` so later bucket-0
+  packets execute before it. Passes link through `pass_head`/`pass_tail` and the
+  last `leave` points at the main table's last bucket in `end_frame`. Begin saves
+  camera/depth shift and moves the GTE geometry offset to the target center; end
+  restores them. Lights are not saved. Targets are single-buffered VRAM, safe
+  only because `end_frame` calls `DrawSync` before submitting the next list.
+- **GPU draw-mode bits:** `DR_TPAGE` packets must pass `renderer->dither` as the
+  dither bit (bit 9), or dithering turns off for the rest of the list. Blend
+  mode (ABR) comes from a textured primitive's own `tpage`, but untextured
+  semi-transparent primitives and `SPRT` use the current draw mode, so they need
+  a preceding `DR_TPAGE` (`psxe_tpage_with_blend` rewrites ABR bits).
 - **GTE global state:** camera projection, matrices, light matrix, back color,
   and color matrix are global coprocessor state. `psxe_draw_mesh` must set the
   object/view/light state before transforming each mesh; callers must not expect
@@ -250,9 +272,12 @@ CRC32, and exact-block file I/O.
 
 ### [`src/include/psxe/render.h`](src/include/psxe/render.h)
 
-Defines renderer/material/texture/mesh/camera structures and the 3D, sprite, and
+Defines renderer/texture/mesh/camera structures, per-face flags, the
+`psxe_material` override (texture, color mode, effects, blend), `psxe_object`,
+`psxe_sprite`, `psxe_render_target`, and the 3D, sprite, render-to-texture, and
 UI API. Context arrays make memory cost explicit. `psxe_face` is triangular and
-uses indices into immutable vertex/normal arrays.
+uses indices into immutable vertex/normal arrays; materials let instances differ
+without mutating shared mesh data.
 
 ### [`src/render/render.c`](src/render/render.c)
 
@@ -261,21 +286,61 @@ composition, lights, TIM upload, mesh submission, sprites, panels, and font
 sorting.
 
 - **Key functions:** `psxe_renderer_allocate` enforces packet bounds;
+  `psxe_renderer_bucket` resolves the current destination table;
   `psxe_make_object_matrix` combines inverse camera and object transform;
-  `psxe_draw_mesh` validates indices, transforms three vertices, rejects
-  backfaces/depth, optionally lights, then emits `POLY_F3`/`POLY_FT3`;
-  `psxe_renderer_end_frame` owns synchronization and buffer flip.
+  `psxe_draw_mesh_material` validates indices, resolves material texture/color/
+  effects, transforms three vertices, rejects backfaces/depth, optionally
+  lights, then emits `POLY_F3`/`POLY_FT3` (+`DR_TPAGE` for untextured blended
+  faces); `psxe_draw_mesh` is the `NULL`-material wrapper;
+  `psxe_renderer_end_frame` owns synchronization, pass-chain submission, and
+  buffer flip.
 - **Tests:** target compilation and cube rendering. Near-plane clipping,
-  off-screen clipping, textured sample assets, fog, Gouraud shading, packet
-  stress, PAL, and hardware captures are gaps.
-- **Common mistakes:** PS1 texture pages use word-based TIM widths; state packets
-  for sprites must execute before sprite packets despite LIFO OT insertion; GTE
-  global state must be re-established per mesh.
+  off-screen clipping, TIM sample assets, fog, Gouraud shading, packet stress,
+  PAL, and hardware captures are gaps.
+- **Common mistakes:** PS1 texture pages use word-based TIM widths; 16-bit page
+  `u` is `x & 63`; state packets for sprites must execute before sprite packets
+  despite LIFO OT insertion; GTE global state must be re-established per mesh.
+
+### [`src/render/render_internal.h`](src/render/render_internal.h)
+
+Private declarations shared by renderer translation units: the packet
+allocator, destination-bucket lookup, and ABR rewrite helper. Not installed as
+public API; do not include it from games.
+
+### [`src/render/object.c`](src/render/object.c)
+
+Owns `psxe_material_*` defaults/setters and `psxe_object_*` helpers. It never
+allocates packets; `psxe_object_draw` forwards to `psxe_draw_mesh_material`.
+Rotation helpers wrap to 0..4095.
+
+### [`src/render/sprite.c`](src/render/sprite.c)
+
+Owns `psxe_sprite_*` and the `psxe_draw_sprite` shortcut. Draw selects `TILE`
+(solid/untextured), `SPRT`+`DR_TPAGE` (unscaled), or `POLY_FT4`
+(scaled/flipped). Texel coordinates clamp to 0..255.
+
+- **Tests:** cube sample scaled/flipped render-target preview; atlas TIM, solid
+  sprite, blend-mode, and layer captures are gaps.
+
+### [`src/render/target.c`](src/render/target.c)
+
+Owns render-target validation, pass begin/end, `DR_ENV` construction from
+public SDK macros, and the 16-bit texture view.
+
+- **Key subparts:** `psxe_render_target_init` rejects misaligned, oversized,
+  page-crossing, framebuffer- or font-overlapping rectangles; begin allocates
+  the pass table and both environment packets all-or-nothing from the packet
+  arena.
+- **Tests:** cube sample draws two 128x128 targets per frame; emulator VRAM
+  capture, multiple-pass ordering, STP/black-texel behavior, and hardware runs
+  are gaps.
+- **Common mistake:** sampling a target in its own pass, black (`0x0000`) texels
+  becoming transparent, or overlapping a TIM (no VRAM allocator exists).
 
 ### [`src/include/psxe/scene.h`](src/include/psxe/scene.h)
 
 Declares a fixed entity pool with generational handles, transforms, optional
-mesh, and visibility. It is a minimal render scene, not a general component or
+mesh, per-entity `psxe_material`, and visibility. It is a minimal render scene, not a general component or
 serialization system.
 
 ### [`src/core/scene.c`](src/core/scene.c)
@@ -285,7 +350,7 @@ destruction, and visible mesh iteration.
 
 - **Key functions:** `psxe_scene_id_valid` centralizes handle validity;
   `psxe_scene_destroy` invalidates stale handles before reuse;
-  `psxe_scene_render` submits active visible meshes only.
+  `psxe_scene_render` submits active visible meshes with their material only.
 - **Tests:** cube integration; focused generation/capacity unit tests are absent.
 
 ### [`src/include/psxe/engine.h`](src/include/psxe/engine.h)
@@ -317,7 +382,8 @@ target. Add sample-specific embedded assets with PSn00bSDK helpers here.
 ### [`samples/cube/main.c`](samples/cube/main.c)
 
 Integration sample defining a lit 12-triangle cube, one scene entity, controller
-movement, UI diagnostics, and save/load callbacks.
+movement, material effect cycling, two render targets shown on a textured quad
+object and a scaled/flippable sprite, UI diagnostics, and save/load callbacks.
 
 - **Key subparts:** `cube_faces` demonstrates winding/normals/materials;
   `game_update` demonstrates edge/held input and synchronous card operations;
@@ -406,6 +472,22 @@ tools, sample inputs from elsewhere, or future third-party assets.
 - **Gap:** no near clipping, subdivision, Gouraud, depth cue/fog, animation,
   frustum/mesh culling, VRAM allocator, or cooked-asset sample.
 
+### Materials, objects, and sprite structs — Experimental/scaffold
+
+- **Behavior:** `psxe_material` overrides texture, color (face/replace/tint),
+  effects (unlit, untextured, semi-transparent, double-sided, sprite flips), and
+  the four GPU blend modes per object, entity, or sprite without GTE cost.
+  `psxe_object`/`psxe_sprite` setters change texture/region/size/position.
+- **Gap:** no sprite rotation, sprite sheets/animation helpers, per-face material
+  ranges, or emulator captures of every blend mode.
+
+### Render to texture — Experimental/scaffold
+
+- **Behavior:** bounded offscreen passes into validated 16-bit VRAM rectangles,
+  executed before the main pass in begin order and sampled as `psxe_texture`.
+- **Gap:** single-buffered only, no paletted/8-bit targets, no VRAM allocator,
+  no automatic light restore, no emulator/hardware validation.
+
 ### Controllers — Experimental/scaffold
 
 - **Behavior:** two ports, common digital/analog IDs, axes, held/edge masks.
@@ -449,6 +531,18 @@ tools, sample inputs from elsewhere, or future third-party assets.
   an emulator VRAM/frame capture.
 - **Status:** hardware behavior and regression risk.
 
+### Render-target texels are transparent or missing
+
+- **Symptom / wrong assumption:** holes in a render-target texture, or the
+  target shows stale/garbage pixels.
+- **Cause and invariant:** sampled 16-bit texel `0x0000` is transparent; the pass
+  silently drops when the packet arena cannot hold `ot_length * 4 + 72` bytes;
+  VRAM is not allocated, so a TIM can overwrite the rectangle.
+- **Safe pattern / check:** non-black clear color, check `begin`'s return and
+  `target_passes`, author TIM positions away from targets, inspect VRAM in
+  PCSX-Redux.
+- **Status:** hardware behavior plus deliberate bounded limitation.
+
 ### Capacity macros can break ABI
 
 - **Symptom / wrong assumption:** context fields corrupt despite individually
@@ -463,8 +557,14 @@ tools, sample inputs from elsewhere, or future third-party assets.
 
 - Game lifecycle: `psxe_engine_init/run/stop` →
   [`src/core/engine.c`](src/core/engine.c).
-- 3D/2D public drawing and textures: `psxe_renderer_*`, `psxe_draw_*`, `psxe_ui_*`
-  → [`src/render/render.c`](src/render/render.c).
+- 3D/2D public drawing and textures: `psxe_renderer_*`, `psxe_draw_mesh*`,
+  `psxe_texture_*`, `psxe_ui_*` → [`src/render/render.c`](src/render/render.c).
+- Materials and objects: `psxe_material_*`, `psxe_object_*` →
+  [`src/render/object.c`](src/render/object.c).
+- Sprites: `psxe_sprite_*`, `psxe_draw_sprite` →
+  [`src/render/sprite.c`](src/render/sprite.c).
+- Render to texture: `psxe_render_target_*` →
+  [`src/render/target.c`](src/render/target.c).
 - Scene handles/render iteration: `psxe_scene_*` →
   [`src/core/scene.c`](src/core/scene.c).
 - Controller snapshots: `psxe_input_*`, `psxe_button_*` →
@@ -511,8 +611,9 @@ data handling are planned, not shipped.
 - Engine/source ABI and all module link dependencies → full `./build.sh debug`.
 - Disc manifest/boot-name consistency → `psxe_cube_iso` output from the same
   command, then emulator boot (manual).
-- 3D/light/scene/UI and input/save integration →
-  [`samples/cube/main.c`](samples/cube/main.c) (manual runtime).
+- 3D/light/scene/UI, materials/effects, objects, sprites, render targets, and
+  input/save integration → [`samples/cube/main.c`](samples/cube/main.c)
+  (manual runtime; not yet emulator-verified for the render-target path).
 - Script syntax → `bash -n build.sh run.sh thirds/setup_macos.sh`.
 - Dependency installation → `./thirds/setup_macos.sh --check`.
 - Audio playback → no bundled VAG sample; compile only, explicit known test gap.
@@ -547,7 +648,8 @@ data handling are planned, not shipped.
 ### Experimental / Scaffold
 
 - macOS-local reproducible target toolchain/SDK bootstrap.
-- Engine static library, callback loop, scene pool, 3D/2D renderer, controller
+- Engine static library, callback loop, scene pool, 3D/2D renderer, materials
+  and effects, object/sprite structs, render-to-texture passes, controller
   snapshots, resident VAG/SPU path, one-block saves, cube EXE and BIN/CUE.
 
 ### Known Gaps

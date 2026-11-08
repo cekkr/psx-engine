@@ -13,6 +13,9 @@ set(PSXE_SOURCES
     src/core/engine.c
     src/core/scene.c
     src/render/render.c
+    src/render/object.c
+    src/render/sprite.c
+    src/render/target.c
     src/platform/audio.c
     src/platform/input.c
     src/platform/memory_card.c

@@ -29,6 +29,7 @@ psxe_entity_id psxe_scene_create(psxe_scene *scene) {
             entity->active = true;
             entity->visible = true;
             entity->mesh = NULL;
+            entity->material = psxe_material_default();
             entity->transform = psxe_transform_identity();
             ++scene->active_count;
             result.index = index;
@@ -77,7 +78,7 @@ void psxe_scene_render(const psxe_scene *scene, psxe_renderer *renderer) {
     for (index = 0; index < PSXE_MAX_ENTITIES; ++index) {
         const psxe_entity *entity = &scene->entities[index];
         if (entity->active && entity->visible && (entity->mesh != NULL)) {
-            psxe_draw_mesh(renderer, entity->mesh, &entity->transform);
+            psxe_draw_mesh_material(renderer, entity->mesh, &entity->transform, &entity->material);
         }
     }
 }

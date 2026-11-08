@@ -16,6 +16,7 @@ typedef struct psxe_entity_id {
 typedef struct psxe_entity {
     psxe_transform transform;
     const psxe_mesh *mesh;
+    psxe_material material; /* per-entity texture/color/effect override */
     uint16_t generation;
     bool active;
     bool visible;

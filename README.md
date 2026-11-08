@@ -12,6 +12,13 @@ needed to grow complete games without hiding the console's constraints:
 - GTE-accelerated triangle projection, back-face rejection, directional
   lighting, affine textured or colored materials, ordering-table depth sorting,
   double buffering, and GPU dithering;
+- per-object/per-sprite materials: texture swaps, replace/tint colors, unlit
+  and untextured shortcuts, and the four GPU blend modes, with no extra GTE
+  work;
+- `psxe_object` mesh instances and `psxe_sprite` rectangles with atlas
+  regions, scaling, flipping, and layers;
+- render-to-texture passes into offscreen VRAM, sampled as textures in the
+  same frame;
 - 2D sprites, translucent panels, and debug-font UI in the same display list;
 - edge-triggered digital and analog-controller state for two ports;
 - VAG upload to SPU RAM and round-robin playback across 24 hardware voices;
@@ -63,6 +70,11 @@ integration example.
 
 - D-pad left/right moves the cube laterally.
 - D-pad up/down changes its depth.
+- Cross cycles the cube's material effect (normal, tint, unlit, additive,
+  flat white).
+- Circle swaps which of two render targets the spinning screen and the
+  preview sprite show.
+- Triangle mirrors the preview sprite.
 - Start writes its rotation to memory-card slot 1.
 - Select restores the saved rotation.
 
