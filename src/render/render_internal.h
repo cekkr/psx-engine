@@ -18,4 +18,31 @@ static inline uint16_t psxe_tpage_with_blend(uint16_t tpage, uint8_t blend) {
     return (uint16_t)((tpage & ~(3u << 5)) | ((blend & 3u) << 5));
 }
 
+/* GTE lighting state for one mesh, built on the CPU from the light set. */
+typedef struct psxe_light_state {
+    MATRIX light;  /* world-space rows: unit directions toward up to 3 lights */
+    MATRIX color;  /* columns: per-light RGB in 4.12 */
+    int32_t back[3]; /* ambient + folded lights, 4096 = full brightness */
+} psxe_light_state;
+
+/* Ranks every enabled light not excluded by exclude_mask by its contribution
+ * at origin, keeps the best three for the GTE rows, and folds ambient lights,
+ * the set's ambient color, and the remainder into the back color. Updates the
+ * renderer's light counters. Touches no GTE state. */
+void psxe_light_select(
+    psxe_renderer *renderer,
+    const VECTOR *origin,
+    uint8_t exclude_mask,
+    const psxe_light *extra_lights,
+    uint16_t extra_count,
+    psxe_light_state *state
+);
+
+/* Normalizes (x, y, z) to length ONE; returns the input length (0 = degenerate,
+ * out untouched). Handles any int32 range. */
+int32_t psxe_vector_normalize(int32_t x, int32_t y, int32_t z, SVECTOR *out);
+
+/* out = m * v (rows of m in 4.12), computed on the CPU. */
+void psxe_matrix_apply(const MATRIX *m, int32_t x, int32_t y, int32_t z, VECTOR *out);
+
 #endif

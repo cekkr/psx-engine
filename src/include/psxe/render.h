@@ -50,6 +50,45 @@ typedef enum psxe_effect_flags {
     PSXE_EFFECT_FLIP_Y = 1 << 5           /* sprites only: mirror vertically */
 } psxe_effect_flags;
 
+/* Light kinds. Only DIRECTIONAL and POINT occupy one of the three GTE light
+ * rows; AMBIENT adds to the GTE back color. */
+typedef enum psxe_light_type {
+    PSXE_LIGHT_DIRECTIONAL = 0,
+    PSXE_LIGHT_POINT = 1,
+    PSXE_LIGHT_AMBIENT = 2
+} psxe_light_type;
+
+/* Point-light attenuation, evaluated on the CPU once per mesh at its origin.
+ * t = (radius - distance) / radius, clamped to 0..1. */
+typedef enum psxe_light_falloff {
+    PSXE_FALLOFF_LINEAR = 0, /* t */
+    PSXE_FALLOFF_SMOOTH = 1, /* t * t: softer edge, faster drop near the light */
+    PSXE_FALLOFF_NONE = 2    /* constant; radius ignored */
+} psxe_light_falloff;
+
+#define PSXE_LIGHT_LAYER_DEFAULT 0x01u
+#define PSXE_LIGHT_LAYER_ALL 0xffu
+
+/* A light description. Plain data: helpers never touch GTE state. */
+typedef struct psxe_light {
+    VECTOR position;   /* POINT: world position (scene lights: offset from entity) */
+    SVECTOR direction; /* DIRECTIONAL: unit vector (ONE) from surfaces toward the light */
+    psxe_color color;
+    uint8_t type;      /* psxe_light_type */
+    uint8_t falloff;   /* psxe_light_falloff */
+    uint8_t layers;    /* bit set matched against psxe_material.light_exclude */
+    bool enabled;
+    int32_t intensity; /* 20.12 multiplier of color; ONE = color at full strength */
+    int32_t radius;    /* POINT: world units where the contribution reaches zero */
+} psxe_light;
+
+/* Fixed-capacity light set plus ambient color. */
+typedef struct psxe_light_set {
+    psxe_light lights[PSXE_MAX_LIGHTS];
+    uint16_t count;
+    psxe_color ambient;
+} psxe_light_set;
+
 typedef struct psxe_texture {
     uint16_t tpage;
     uint16_t clut;
@@ -67,6 +106,7 @@ typedef struct psxe_material {
     uint8_t color_mode;          /* psxe_color_mode */
     uint8_t effects;             /* psxe_effect_flags */
     uint8_t blend;               /* psxe_blend_mode */
+    uint8_t light_exclude;       /* lights whose layers intersect this are ignored */
 } psxe_material;
 
 typedef struct psxe_face {
@@ -168,8 +208,12 @@ typedef struct psxe_renderer {
     int16_t width;
     int16_t height;
     psxe_camera camera;
-    MATRIX light_matrix;
-    MATRIX color_matrix;
+    psxe_light_set lights;
+    /* Per-frame light diagnostics, summed over every lit mesh draw. */
+    uint32_t lights_considered; /* enabled, unmasked lights evaluated */
+    uint32_t lights_applied;    /* placed in a GTE light row or ambient */
+    uint32_t lights_folded;     /* beyond three rows, approximated in back color */
+    uint32_t lights_dropped;    /* rejected because a light set was full */
     bool dither;
     /* Current destination ordering table (main buffer or a render target). */
     uint32_t *ordering_table;
@@ -177,6 +221,7 @@ typedef struct psxe_renderer {
     /* Render-to-texture pass state. */
     const psxe_render_target *active_target;
     psxe_camera saved_camera;
+    psxe_light_set saved_lights;
     int saved_depth_shift;
     DR_ENV *pass_head;
     DR_ENV *pass_tail;
@@ -187,12 +232,30 @@ void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *confi
 void psxe_renderer_begin_frame(psxe_renderer *renderer);
 void psxe_renderer_end_frame(psxe_renderer *renderer);
 void psxe_renderer_set_camera(psxe_renderer *renderer, const psxe_camera *camera);
+
+/* Lights */
+void psxe_light_init(psxe_light *light, psxe_light_type type);
+void psxe_light_set_color(psxe_light *light, psxe_color color, int32_t intensity);
+void psxe_light_set_direction(psxe_light *light, int32_t x, int32_t y, int32_t z);
+void psxe_light_set_position(psxe_light *light, int32_t x, int32_t y, int32_t z);
+void psxe_light_set_range(psxe_light *light, int32_t radius, psxe_light_falloff falloff);
+void psxe_light_set_layers(psxe_light *light, uint8_t layers);
+void psxe_light_set_enabled(psxe_light *light, bool enabled);
+
+void psxe_renderer_clear_lights(psxe_renderer *renderer);
+bool psxe_renderer_add_light(psxe_renderer *renderer, const psxe_light *light);
+uint16_t psxe_renderer_set_lights(psxe_renderer *renderer, const psxe_light *lights, uint16_t count);
+psxe_light *psxe_renderer_light(psxe_renderer *renderer, uint16_t index);
+void psxe_renderer_set_ambient(psxe_renderer *renderer, psxe_color ambient);
+/* One-light wrapper: clears the set, adds one directional light, sets ambient. */
 void psxe_renderer_set_directional_light(
     psxe_renderer *renderer,
     const SVECTOR *direction,
     psxe_color color,
     psxe_color ambient
 );
+/* Debug: a size x size solid square at a POINT light's projected position. */
+void psxe_draw_light_marker(psxe_renderer *renderer, const psxe_light *light, int16_t size);
 bool psxe_texture_load_tim(psxe_texture *texture, const uint32_t *tim_data);
 
 /* Materials */
@@ -200,6 +263,7 @@ psxe_material psxe_material_default(void);
 void psxe_material_set_texture(psxe_material *material, const psxe_texture *texture);
 void psxe_material_set_color(psxe_material *material, psxe_color color, psxe_color_mode mode);
 void psxe_material_set_effects(psxe_material *material, uint8_t effects, psxe_blend_mode blend);
+void psxe_material_set_light_exclude(psxe_material *material, uint8_t layers);
 
 /* Meshes */
 void psxe_draw_mesh(
@@ -212,6 +276,16 @@ void psxe_draw_mesh_material(
     const psxe_mesh *mesh,
     const psxe_transform *transform,
     const psxe_material *material
+);
+/* As psxe_draw_mesh_material, also considering extra world-space lights
+ * (borrowed for this call only) alongside the renderer's light set. */
+void psxe_draw_mesh_lights(
+    psxe_renderer *renderer,
+    const psxe_mesh *mesh,
+    const psxe_transform *transform,
+    const psxe_material *material,
+    const psxe_light *extra_lights,
+    uint16_t extra_count
 );
 
 /* Objects */

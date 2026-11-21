@@ -10,6 +10,7 @@ typedef struct cube_save {
 typedef struct cube_game {
     psxe_scene scene;
     psxe_entity_id cube;
+    psxe_entity_id lamp;       /* small unlit cube that owns a point light */
     psxe_camera camera;
     psxe_render_target targets[2];
     psxe_object mini_cube;     /* drawn only inside the render targets */
@@ -17,6 +18,9 @@ typedef struct cube_game {
     psxe_sprite preview;       /* scaled 2D view of the same target */
     unsigned int shown_target;
     unsigned int effect;
+    unsigned int ambient;
+    int16_t lamp_angle;
+    bool show_markers;
     char status[64];
 } cube_game;
 
@@ -106,6 +110,59 @@ static void apply_effect(psxe_entity *entity, unsigned int effect) {
     }
 }
 
+static const psxe_color ambient_presets[] = {
+    { 40, 40, 52 }, { 8, 8, 8 }, { 96, 80, 64 }
+};
+static const char *const ambient_names[] = { "COOL", "DARK", "WARM" };
+
+#define LAMP_ORBIT 320
+#define LAMP_HEIGHT -140
+
+static void setup_lights(cube_game *game, psxe_renderer *renderer) {
+    psxe_light sun;
+    psxe_light lamp_light;
+    psxe_entity *lamp;
+
+    /* Static world light: dim blue directional from the upper left. */
+    psxe_light_init(&sun, PSXE_LIGHT_DIRECTIONAL);
+    psxe_light_set_direction(&sun, -ONE, -ONE, -ONE / 2);
+    psxe_light_set_color(&sun, (psxe_color){ 110, 130, 190 }, ONE);
+    psxe_renderer_clear_lights(renderer);
+    psxe_renderer_add_light(renderer, &sun);
+    psxe_renderer_set_ambient(renderer, ambient_presets[0]);
+
+    /* Moving point light owned by a scene entity. Light position is an
+     * entity-local offset, so it follows the lamp transform. */
+    game->lamp = psxe_scene_create(&game->scene);
+    lamp = psxe_scene_get(&game->scene, game->lamp);
+    if (lamp == NULL) {
+        return;
+    }
+    lamp->mesh = &cube_mesh;
+    lamp->transform.scale = (VECTOR){ ONE / 6, ONE / 6, ONE / 6 };
+    psxe_material_set_color(&lamp->material, (psxe_color){ 255, 200, 96 }, PSXE_COLOR_REPLACE);
+    psxe_material_set_effects(&lamp->material, PSXE_EFFECT_UNLIT, PSXE_BLEND_HALF);
+
+    psxe_light_init(&lamp_light, PSXE_LIGHT_POINT);
+    psxe_light_set_color(&lamp_light, (psxe_color){ 255, 180, 80 }, ONE + ONE / 2);
+    psxe_light_set_range(&lamp_light, 700, PSXE_FALLOFF_SMOOTH);
+    psxe_scene_set_light(&game->scene, game->lamp, &lamp_light);
+}
+
+static void update_lamp(cube_game *game) {
+    const psxe_entity *cube = psxe_scene_get_const(&game->scene, game->cube);
+    psxe_entity *lamp = psxe_scene_get(&game->scene, game->lamp);
+
+    if ((cube == NULL) || (lamp == NULL)) {
+        return;
+    }
+    game->lamp_angle = (int16_t)((game->lamp_angle + 20) & (PSXE_ANGLE_FULL_TURN - 1));
+    lamp->transform.position.vx = cube->transform.position.vx + ((isin(game->lamp_angle) * LAMP_ORBIT) >> 12);
+    lamp->transform.position.vy = cube->transform.position.vy + LAMP_HEIGHT;
+    lamp->transform.position.vz = cube->transform.position.vz + ((icos(game->lamp_angle) * LAMP_ORBIT) >> 12);
+    lamp->transform.rotation.vy = game->lamp_angle;
+}
+
 static void show_target(cube_game *game, unsigned int index) {
     const psxe_texture *texture = psxe_render_target_texture(&game->targets[index]);
     uint8_t flips = (uint8_t)(game->preview.material.effects & (PSXE_EFFECT_FLIP_X | PSXE_EFFECT_FLIP_Y));
@@ -126,6 +183,7 @@ static void game_init(psxe_engine *engine, void *user_data) {
     entity = psxe_scene_get(&game->scene, game->cube);
     entity->mesh = &cube_mesh;
     entity->transform.position.vz = 900;
+    setup_lights(game, &engine->renderer);
 
     game->camera = (psxe_camera){
         .position = { 0, 0, 0 },
@@ -171,6 +229,7 @@ static void game_update(psxe_engine *engine, void *user_data) {
     entity->transform.rotation.vy += 14;
     psxe_object_rotate(&game->mini_cube, 0, 24, 8);
     psxe_object_rotate(&game->screen, 0, 12, 0);
+    update_lamp(game);
 
     if (psxe_button_pressed(pad, PAD_CROSS)) {
         game->effect = (game->effect + 1u) % (unsigned int)PSXE_ARRAY_COUNT(effect_names);
@@ -183,6 +242,21 @@ static void game_update(psxe_engine *engine, void *user_data) {
     }
     if (psxe_button_pressed(pad, PAD_TRIANGLE)) {
         game->preview.material.effects ^= PSXE_EFFECT_FLIP_X;
+    }
+    if (psxe_button_pressed(pad, PAD_SQUARE)) {
+        game->ambient = (game->ambient + 1u) % (unsigned int)PSXE_ARRAY_COUNT(ambient_presets);
+        psxe_renderer_set_ambient(&engine->renderer, ambient_presets[game->ambient]);
+        snprintf(game->status, sizeof(game->status), "AMBIENT: %s", ambient_names[game->ambient]);
+    }
+    if (psxe_button_pressed(pad, PAD_L1)) {
+        psxe_light *lamp_light = psxe_scene_light(&game->scene, game->lamp);
+        if (lamp_light != NULL) {
+            lamp_light->enabled = !lamp_light->enabled;
+            snprintf(game->status, sizeof(game->status), "LAMP: %s", lamp_light->enabled ? "ON" : "OFF");
+        }
+    }
+    if (psxe_button_pressed(pad, PAD_R1)) {
+        game->show_markers = !game->show_markers;
     }
 
     if (psxe_button_held(pad, PAD_LEFT)) {
@@ -233,6 +307,13 @@ static void game_render(psxe_engine *engine, void *user_data) {
     for (index = 0; index < 2u; ++index) {
         if (psxe_render_target_begin(renderer, &game->targets[index])) {
             psxe_renderer_set_camera(renderer, &target_camera);
+            if (index == 1u) {
+                /* Per-pass light set; render_target_end restores the main one. */
+                static const SVECTOR green_light = { ONE, -ONE, -ONE, 0 };
+                psxe_renderer_set_directional_light(
+                    renderer, &green_light, (psxe_color){ 120, 255, 140 }, (psxe_color){ 24, 48, 24 }
+                );
+            }
             psxe_object_set_color(
                 &game->mini_cube,
                 (index == 0u) ? (psxe_color){ 128, 128, 128 } : (psxe_color){ 80, 255, 160 },
@@ -246,6 +327,12 @@ static void game_render(psxe_engine *engine, void *user_data) {
 
     psxe_scene_render(&game->scene, renderer);
     psxe_object_draw(renderer, &game->screen);
+    if (game->show_markers) {
+        psxe_light lamp_world;
+        if (psxe_scene_light_world(&game->scene, game->lamp, &lamp_world)) {
+            psxe_draw_light_marker(renderer, &lamp_world, 6);
+        }
+    }
     psxe_sprite_draw(renderer, &game->preview);
     psxe_ui_panel(&engine->renderer, 4, 4, 312, 34, (psxe_color){ 16, 16, 28 }, true);
     psxe_ui_text(&engine->renderer, 10, 10, "PSX-ENGINE / 3D FOUNDATION");
@@ -260,6 +347,16 @@ static void game_render(psxe_engine *engine, void *user_data) {
         (unsigned int)engine->renderer.target_passes
     );
     psxe_ui_text(&engine->renderer, 10, 228, diagnostics);
+    snprintf(
+        diagnostics,
+        sizeof(diagnostics),
+        "LIGHTS CON %lu APP %lu FOLD %lu DROP %lu",
+        (unsigned long)engine->renderer.lights_considered,
+        (unsigned long)engine->renderer.lights_applied,
+        (unsigned long)engine->renderer.lights_folded,
+        (unsigned long)engine->renderer.lights_dropped
+    );
+    psxe_ui_text(&engine->renderer, 10, 218, diagnostics);
 }
 
 int main(void) {

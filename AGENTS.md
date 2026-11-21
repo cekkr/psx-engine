@@ -109,8 +109,8 @@ silently simulate faster/slower without an explicit game policy.
   inserted into bucket 0 immediately after `ClearOTagR` so later bucket-0
   packets execute before it. Passes link through `pass_head`/`pass_tail` and the
   last `leave` points at the main table's last bucket in `end_frame`. Begin saves
-  camera/depth shift and moves the GTE geometry offset to the target center; end
-  restores them. Lights are not saved. Targets are single-buffered VRAM, safe
+  camera/depth shift/light set and moves the GTE geometry offset to the target
+  center; end restores them, so a pass may install its own lights. Targets are single-buffered VRAM, safe
   only because `end_frame` calls `DrawSync` before submitting the next list.
 - **GPU draw-mode bits:** `DR_TPAGE` packets must pass `renderer->dither` as the
   dither bit (bit 9), or dithering turns off for the rest of the list. Blend
@@ -118,9 +118,25 @@ silently simulate faster/slower without an explicit game policy.
   semi-transparent primitives and `SPRT` use the current draw mode, so they need
   a preceding `DR_TPAGE` (`psxe_tpage_with_blend` rewrites ABR bits).
 - **GTE global state:** camera projection, matrices, light matrix, back color,
-  and color matrix are global coprocessor state. `psxe_draw_mesh` must set the
-  object/view/light state before transforming each mesh; callers must not expect
-  private concurrent renderer state.
+  and color matrix are global coprocessor state. `psxe_draw_mesh_lights` (all
+  mesh draws route through it) must run light selection and the SDK matrix
+  helpers *before* installing the mesh's rotation/translation/light/color/back
+  registers, because those helpers may use GTE registers. Meshes that cannot
+  light (`PSXE_EFFECT_UNLIT` or no normals) skip selection and leave the light
+  registers stale, which is safe only because no face of theirs is lit.
+- **Light selection:** [`src/render/light.c`](src/render/light.c)
+  `psxe_light_select` evaluates the renderer set plus borrowed extra lights at
+  the mesh origin each draw; it never touches GTE state. Directions point from
+  surfaces toward the light (unit = `ONE`), stored world-space and multiplied by
+  the object rotation (not scale). Up to three directional/point lights fill
+  GTE rows; ambient lights and the set ambient add to back color; the rest add a
+  quarter of their color to back color and count as `lights_folded`. Colors map
+  `255 * ONE / 255 = 4096` (1.0); back color clamps to 255 before
+  `gte_SetBackColor`. Directional `direction` set by field assignment is not
+  renormalized.
+- **Scene light slots:** `psxe_entity.light_slot` and
+  `psxe_scene_light_slot.owner` must point at each other; `psxe_scene_destroy`
+  clears the slot before bumping generation, and gather re-checks both links.
 - **Active-low pads:** BIOS pad bits are zero when pressed.
   [`src/platform/input.c`](src/platform/input.c) inverts them once, then derives
   `pressed` and `released`. Game code must use `psxe_pad_state`, not reinterpret
@@ -206,7 +222,8 @@ the standard macOS application path. It does not download an emulator or BIOS.
 ### [`src/include/psxe/config.h`](src/include/psxe/config.h)
 
 Owns compile-time capacities: `PSXE_OT_LENGTH`, `PSXE_PACKET_BUFFER_SIZE`,
-`PSXE_MAX_ENTITIES`, audio voice count, card block size, and maximum payload.
+`PSXE_MAX_ENTITIES`, `PSXE_MAX_LIGHTS`, `PSXE_MAX_SCENE_LIGHTS` (range-checked
+with `#error`), audio voice count, card block size, and maximum payload.
 Override project-wide before headers instantiate context layouts; mismatched
 translation-unit overrides create ABI corruption.
 
@@ -274,24 +291,25 @@ CRC32, and exact-block file I/O.
 
 Defines renderer/texture/mesh/camera structures, per-face flags, the
 `psxe_material` override (texture, color mode, effects, blend), `psxe_object`,
-`psxe_sprite`, `psxe_render_target`, and the 3D, sprite, render-to-texture, and
-UI API. Context arrays make memory cost explicit. `psxe_face` is triangular and
+`psxe_sprite`, `psxe_render_target`, `psxe_light`/`psxe_light_set`, and the 3D,
+sprite, render-to-texture, light, and UI API. Context arrays make memory cost explicit. `psxe_face` is triangular and
 uses indices into immutable vertex/normal arrays; materials let instances differ
 without mutating shared mesh data.
 
 ### [`src/render/render.c`](src/render/render.c)
 
 Owns GPU/GTE setup, double-buffered ordering tables, packet allocation, camera
-composition, lights, TIM upload, mesh submission, sprites, panels, and font
-sorting.
+composition, per-mesh GTE light installation, TIM upload, mesh submission,
+panels, and font sorting.
 
 - **Key functions:** `psxe_renderer_allocate` enforces packet bounds;
   `psxe_renderer_bucket` resolves the current destination table;
   `psxe_make_object_matrix` combines inverse camera and object transform;
-  `psxe_draw_mesh_material` validates indices, resolves material texture/color/
-  effects, transforms three vertices, rejects backfaces/depth, optionally
-  lights, then emits `POLY_F3`/`POLY_FT3` (+`DR_TPAGE` for untextured blended
-  faces); `psxe_draw_mesh` is the `NULL`-material wrapper;
+  `psxe_draw_mesh_lights` validates indices, resolves material texture/color/
+  effects, selects lights, installs GTE state, transforms three vertices,
+  rejects backfaces/depth, optionally lights, then emits `POLY_F3`/`POLY_FT3`
+  (+`DR_TPAGE` for untextured blended faces); `psxe_draw_mesh_material` and
+  `psxe_draw_mesh` are the no-extra-lights/`NULL`-material wrappers;
   `psxe_renderer_end_frame` owns synchronization, pass-chain submission, and
   buffer flip.
 - **Tests:** target compilation and cube rendering. Near-plane clipping,
@@ -303,9 +321,29 @@ sorting.
 
 ### [`src/render/render_internal.h`](src/render/render_internal.h)
 
-Private declarations shared by renderer translation units: the packet
-allocator, destination-bucket lookup, and ABR rewrite helper. Not installed as
-public API; do not include it from games.
+Private declarations shared by renderer translation units (and
+`src/core/scene.c` for CPU vector math): the packet allocator, destination-bucket
+lookup, ABR rewrite helper, `psxe_light_state`, `psxe_light_select`,
+`psxe_vector_normalize`, and `psxe_matrix_apply`. Not installed as public API;
+do not include it from games.
+
+### [`src/render/light.c`](src/render/light.c)
+
+Owns `psxe_light_*` value helpers, the renderer light set
+(`psxe_renderer_clear/add/set_lights`, `psxe_renderer_light`,
+`psxe_renderer_set_ambient`, the `psxe_renderer_set_directional_light`
+wrapper), per-mesh selection, CPU integer sqrt/normalize, and
+`psxe_draw_light_marker`.
+
+- **Key subparts:** `psxe_vector_normalize` rescales any int32 vector into
+  0x2000..0x3fff before squaring; `psxe_consider_light` applies masks,
+  attenuation (`LINEAR` t, `SMOOTH` t², `NONE`), and top-three ranking by
+  scaled `r+g+b`; the marker projects on the CPU into bucket 1.
+- **Tests:** target compile and cube sample (sun + orbiting lamp + ambient
+  presets + per-pass light set); emulator captures and CPU-tick cost are gaps.
+- **Common mistake:** writing an unnormalized `direction` field, or expecting
+  per-vertex point lighting: attenuation is per mesh origin, so large meshes
+  near a point light light uniformly.
 
 ### [`src/render/object.c`](src/render/object.c)
 
@@ -340,17 +378,23 @@ public SDK macros, and the 16-bit texture view.
 ### [`src/include/psxe/scene.h`](src/include/psxe/scene.h)
 
 Declares a fixed entity pool with generational handles, transforms, optional
-mesh, per-entity `psxe_material`, and visibility. It is a minimal render scene, not a general component or
+mesh, per-entity `psxe_material`, visibility, and a fixed
+`PSXE_MAX_SCENE_LIGHTS` pool of entity-owned lights. It is a minimal render scene, not a general component or
 serialization system.
 
 ### [`src/core/scene.c`](src/core/scene.c)
 
 Owns pool initialization, first-free creation, generation-checked lookup,
-destruction, and visible mesh iteration.
+destruction, entity light slots/world transforms/gathering, and visible mesh
+iteration.
 
 - **Key functions:** `psxe_scene_id_valid` centralizes handle validity;
   `psxe_scene_destroy` invalidates stale handles before reuse;
-  `psxe_scene_render` submits active visible meshes with their material only.
+  `psxe_scene_set_light`/`psxe_scene_clear_light` own slot links;
+  `psxe_scene_gather_lights` emits world-space lights of active entities whose
+  light is enabled (mesh visibility does not matter);
+  `psxe_scene_render` gathers once, then submits active visible meshes with
+  their material and those lights.
 - **Tests:** cube integration; focused generation/capacity unit tests are absent.
 
 ### [`src/include/psxe/engine.h`](src/include/psxe/engine.h)
@@ -381,7 +425,9 @@ target. Add sample-specific embedded assets with PSn00bSDK helpers here.
 
 ### [`samples/cube/main.c`](samples/cube/main.c)
 
-Integration sample defining a lit 12-triangle cube, one scene entity, controller
+Integration sample defining a lit 12-triangle cube, a scene entity, an orbiting
+lamp entity owning a point light, a static directional light with switchable
+ambient presets, a per-pass light set in target B, light counters, controller
 movement, material effect cycling, two render targets shown on a textured quad
 object and a scaled/flippable sprite, UI diagnostics, and save/load callbacks.
 
@@ -466,7 +512,7 @@ tools, sample inputs from elsewhere, or future third-party assets.
 
 ### Lit 3D, sprites, and UI — Experimental/scaffold
 
-- **Behavior:** colored/textured flat triangles, optional directional lighting,
+- **Behavior:** colored/textured flat triangles, optional per-face lighting,
   ordering-table depth, affine GPU texturing, dithering, sprites, panels, text.
 - **Flow:** game/scene → `psxe_draw_mesh`/2D calls → packet arena → OT → GPU.
 - **Gap:** no near clipping, subdivision, Gouraud, depth cue/fog, animation,
@@ -481,12 +527,25 @@ tools, sample inputs from elsewhere, or future third-party assets.
 - **Gap:** no sprite rotation, sprite sheets/animation helpers, per-face material
   ranges, or emulator captures of every blend mode.
 
+### Lights — Experimental/scaffold
+
+- **Behavior:** directional, point, and ambient `psxe_light` values in a
+  `PSXE_MAX_LIGHTS` renderer set and `PSXE_MAX_SCENE_LIGHTS` entity slots;
+  per-mesh top-three selection into GTE rows, remainder folded to back color,
+  layer masks via `psxe_material.light_exclude`, render-target save/restore,
+  point markers, per-frame counters.
+- **Flow:** game/scene → `psxe_draw_mesh_lights` → `psxe_light_select` (CPU)
+  → GTE light/color/back registers → `NCCS` per lit face.
+- **Gap:** flat per-face only (no Gouraud/per-vertex), origin-only ranking (no
+  mesh bounds), no radius debug draw, no measured CPU cost, no emulator
+  captures.
+
 ### Render to texture — Experimental/scaffold
 
 - **Behavior:** bounded offscreen passes into validated 16-bit VRAM rectangles,
   executed before the main pass in begin order and sampled as `psxe_texture`.
 - **Gap:** single-buffered only, no paletted/8-bit targets, no VRAM allocator,
-  no automatic light restore, no emulator/hardware validation.
+  no emulator/hardware validation.
 
 ### Controllers — Experimental/scaffold
 
@@ -563,6 +622,8 @@ tools, sample inputs from elsewhere, or future third-party assets.
   [`src/render/object.c`](src/render/object.c).
 - Sprites: `psxe_sprite_*`, `psxe_draw_sprite` →
   [`src/render/sprite.c`](src/render/sprite.c).
+- Lights: `psxe_light_*`, `psxe_renderer_*light*`, `psxe_renderer_set_ambient`,
+  `psxe_draw_light_marker` → [`src/render/light.c`](src/render/light.c).
 - Render to texture: `psxe_render_target_*` →
   [`src/render/target.c`](src/render/target.c).
 - Scene handles/render iteration: `psxe_scene_*` →
@@ -611,7 +672,7 @@ data handling are planned, not shipped.
 - Engine/source ABI and all module link dependencies → full `./build.sh debug`.
 - Disc manifest/boot-name consistency → `psxe_cube_iso` output from the same
   command, then emulator boot (manual).
-- 3D/light/scene/UI, materials/effects, objects, sprites, render targets, and
+- 3D/light objects/scene lights/UI, materials/effects, objects, sprites, render targets, and
   input/save integration → [`samples/cube/main.c`](samples/cube/main.c)
   (manual runtime; not yet emulator-verified for the render-target path).
 - Script syntax → `bash -n build.sh run.sh thirds/setup_macos.sh`.
@@ -648,8 +709,8 @@ data handling are planned, not shipped.
 ### Experimental / Scaffold
 
 - macOS-local reproducible target toolchain/SDK bootstrap.
-- Engine static library, callback loop, scene pool, 3D/2D renderer, materials
-  and effects, object/sprite structs, render-to-texture passes, controller
+- Engine static library, callback loop, scene pool, 3D/2D renderer, light
+  objects and scene lights, materials and effects, object/sprite structs, render-to-texture passes, controller
   snapshots, resident VAG/SPU path, one-block saves, cube EXE and BIN/CUE.
 
 ### Known Gaps

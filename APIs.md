@@ -24,6 +24,7 @@ coupling.
 - [Engine lifecycle — `engine.h`](#engine-lifecycle--engineh)
 - [Renderer — `render.h`](#renderer--renderh)
 - [Materials and effects](#materials-and-effects)
+- [Lights — `psxe_light`](#lights--psxe_light)
 - [Objects — `psxe_object`](#objects--psxe_object)
 - [Sprites — `psxe_sprite`](#sprites--psxe_sprite)
 - [Render to texture — `psxe_render_target`](#render-to-texture--psxe_render_target)
@@ -50,7 +51,7 @@ coupling.
   pointer. They must outlive every frame that draws them; `static const` data is
   the normal choice.
 - **NULL.** Most functions ignore `NULL` arguments (noted per function). The
-  `*_init` functions and `psxe_renderer_set_directional_light` do not check.
+  `*_init` functions (except `psxe_light_init`) do not check.
 
 ## Configuration macros — `config.h`
 
@@ -59,6 +60,8 @@ coupling.
 | `PSXE_OT_LENGTH` | `1024` | Ordering-table buckets per buffer. Bucket 0 = text, 1 = sprites/panels, 2+ = meshes (larger = farther). |
 | `PSXE_PACKET_BUFFER_SIZE` | `48 * 1024` | GPU packet bytes per buffer (two buffers exist). |
 | `PSXE_MAX_ENTITIES` | `128` | Slots in a `psxe_scene`. |
+| `PSXE_MAX_LIGHTS` | `8` | Lights in the renderer's light set (1..255). |
+| `PSXE_MAX_SCENE_LIGHTS` | `8` | Entity-owned lights in a `psxe_scene` (1..254). |
 | `PSXE_MEMORY_CARD_BLOCK_SIZE` | `8192` | Bytes per save file (one card block). |
 | `PSXE_MAX_AUDIO_VOICES` | `24` | Hardware SPU voices (fixed, not overridable). |
 | `PSXE_MAX_SAVE_PAYLOAD` | `8192 - 544` = 7648 | Largest payload accepted by `psxe_memory_card_save`. |
@@ -189,21 +192,23 @@ int main(void) {
 | `psxe_texture` | VRAM location filled by `psxe_texture_load_tim`: `tpage`, `clut`, `width`, `height`, base `u`/`v`, `valid`. |
 | `psxe_face` | One triangle: `vertex[3]` indices, `normal` index, `uv[3][2]` offsets from the texture's base `u`/`v`, flat `color`, material `flags`. |
 | `psxe_mesh` | Borrowed `vertices`, `normals`, `faces` arrays with their counts, plus an optional `texture`. |
-| `psxe_renderer` | Double buffers and frame state. Fields worth reading: `submitted_primitives`, `dropped_primitives`, `target_passes`, `next_packet`/`packet_end`, `width`, `height`, `camera`. `ordering_table`/`ot_length` point at the current destination (main buffer, or a render target during a pass); the other fields are internal. |
+| `psxe_light`, `psxe_light_set`, `psxe_light_type`, `psxe_light_falloff` | Light values and the renderer's fixed set. See [Lights](#lights--psxe_light). |
+| `psxe_renderer` | Double buffers and frame state. Fields worth reading: `submitted_primitives`, `dropped_primitives`, `target_passes`, `next_packet`/`packet_end`, `width`, `height`, `camera`, `lights`, and the per-frame light counters `lights_considered`, `lights_applied`, `lights_folded`, `lights_dropped`. `ordering_table`/`ot_length` point at the current destination (main buffer, or a render target during a pass); the other fields are internal. |
 
 ### `void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *config)`
 
 Resets the GPU, sets the video mode, creates two stacked draw/display buffers
 (`0,0` and `0,height` in VRAM), initializes the GTE with the screen center as
 geometry offset, loads the debug font at VRAM `(960, 0)`, installs a default
-light (direction `{-2048,-2048,-2048}`, color `{220,220,220}`, ambient
+light set through `psxe_renderer_set_directional_light` (direction
+`{-2048,-2048,-2048}` normalized to `ONE`, color `{220,220,220}`, ambient
 `{48,48,48}`) and a default camera at the origin with projection 160, and
 enables display. `psxe_engine_init` calls it for you.
 
 ### `void psxe_renderer_begin_frame(psxe_renderer *renderer)`
 
-Resets `submitted_primitives`, `dropped_primitives`, and `target_passes` to
-zero. Called by the engine before `render`.
+Resets `submitted_primitives`, `dropped_primitives`, `target_passes`, and the
+four light counters to zero. Called by the engine before `render`.
 
 ### `void psxe_renderer_end_frame(psxe_renderer *renderer)`
 
@@ -228,14 +233,15 @@ psxe_renderer_set_camera(&engine->renderer, &cam);
 
 ### `void psxe_renderer_set_directional_light(psxe_renderer *renderer, const SVECTOR *direction, psxe_color color, psxe_color ambient)`
 
-Sets one directional light (world space, components in `ONE` units) plus the
-ambient color. Color and ambient are written to global GTE registers
-immediately. Lighting is evaluated when `psxe_draw_mesh` runs, so changing the
-light between two draw calls lights those meshes differently in the same frame.
-Arguments are not `NULL`-checked.
+One-light wrapper over the [light set](#lights--psxe_light): clears the
+renderer's lights, adds one directional light (direction normalized to `ONE`,
+pointing from surfaces toward the light, intensity `ONE`), and sets the ambient
+color. Nothing is written to the GTE here; lighting is installed per mesh when
+it is drawn, so changing lights between two draw calls lights those meshes
+differently in the same frame. Ignores `NULL` arguments.
 
 ```c
-SVECTOR sun = { 0, ONE, ONE / 2, 0 };
+SVECTOR sun = { 0, -ONE, ONE / 2, 0 };   /* light above (Y down) and behind */
 psxe_renderer_set_directional_light(&engine->renderer, &sun,
     (psxe_color){ 255, 230, 200 }, (psxe_color){ 40, 40, 60 });
 ```
@@ -351,6 +357,7 @@ typedef struct psxe_material {
     uint8_t color_mode;          /* psxe_color_mode */
     uint8_t effects;             /* psxe_effect_flags, OR-ed */
     uint8_t blend;               /* psxe_blend_mode */
+    uint8_t light_exclude;       /* lights whose layers intersect are ignored */
 } psxe_material;
 ```
 
@@ -385,10 +392,11 @@ blend.
 
 | Function | Behavior |
 | --- | --- |
-| `psxe_material psxe_material_default(void)` | No texture override, color `{128,128,128}`, `PSXE_COLOR_FACE`, no effects, `PSXE_BLEND_HALF`. Drawing with it looks the same as drawing with no material. |
+| `psxe_material psxe_material_default(void)` | No texture override, color `{128,128,128}`, `PSXE_COLOR_FACE`, no effects, `PSXE_BLEND_HALF`, `light_exclude = 0`. Drawing with it looks the same as drawing with no material. |
 | `void psxe_material_set_texture(psxe_material *m, const psxe_texture *t)` | Sets the texture override; `NULL` returns to the mesh's own texture. |
 | `void psxe_material_set_color(psxe_material *m, psxe_color c, psxe_color_mode mode)` | Sets color and color mode. |
 | `void psxe_material_set_effects(psxe_material *m, uint8_t effects, psxe_blend_mode blend)` | Replaces the effect bits and blend mode. |
+| `void psxe_material_set_light_exclude(psxe_material *m, uint8_t layers)` | Lights whose `layers` share a bit with this mask are skipped for the mesh. Default `0` (all lights apply). |
 
 All ignore a `NULL` material.
 
@@ -406,6 +414,110 @@ psxe_material ghost = psxe_material_default();
 psxe_material_set_color(&ghost, (psxe_color){ 96, 160, 255 }, PSXE_COLOR_TINT);
 psxe_material_set_effects(&ghost, PSXE_EFFECT_UNLIT | PSXE_EFFECT_SEMITRANSPARENT, PSXE_BLEND_ADD);
 psxe_draw_mesh_material(&engine->renderer, &player_mesh, &ghost_transform, &ghost);
+```
+
+## Lights — `psxe_light`
+
+Lighting stays flat per face (one `NCCS` per lit face), but any number of
+lights can now affect a scene. The GTE has three light rows, so **for every
+mesh draw** the renderer ranks the candidate lights by their contribution at
+the mesh's origin and keeps the best three. Everything else becomes ambient.
+This runs on the CPU, before the mesh's GTE state is installed, and only for
+meshes that can light (`PSXE_EFFECT_UNLIT` or a mesh without normals skips it).
+
+```c
+typedef struct psxe_light {
+    VECTOR position;   /* POINT: world position (scene lights: entity-local offset) */
+    SVECTOR direction; /* DIRECTIONAL: unit vector (ONE) from surfaces toward the light */
+    psxe_color color;
+    uint8_t type;      /* psxe_light_type */
+    uint8_t falloff;   /* psxe_light_falloff */
+    uint8_t layers;    /* matched against psxe_material.light_exclude */
+    bool enabled;
+    int32_t intensity; /* 20.12; ONE = color at full strength, > ONE overbright */
+    int32_t radius;    /* POINT: world units where the contribution reaches 0 */
+} psxe_light;
+
+typedef struct psxe_light_set {
+    psxe_light lights[PSXE_MAX_LIGHTS];
+    uint16_t count;
+    psxe_color ambient;
+} psxe_light_set;
+```
+
+| `psxe_light_type` | Behavior |
+| --- | --- |
+| `PSXE_LIGHT_DIRECTIONAL` | Constant direction. Candidate for a GTE row. |
+| `PSXE_LIGHT_POINT` | Direction from the mesh origin to `position`, attenuated by distance. Candidate for a GTE row. |
+| `PSXE_LIGHT_AMBIENT` | `color * intensity` added to the back color; no direction. |
+
+| `psxe_light_falloff` (t = (radius − d) / radius, clamped 0..1) | Point-light multiplier |
+| --- | --- |
+| `PSXE_FALLOFF_LINEAR` (default) | t |
+| `PSXE_FALLOFF_SMOOTH` | t², a softer edge |
+| `PSXE_FALLOFF_NONE` | 1 (radius ignored) |
+
+**Per-mesh selection rules.**
+
+1. A light is a candidate when `enabled` and `(layers & material.light_exclude) == 0`
+   (counted in `lights_considered`).
+2. Its effective color is `color * intensity / 255` in 4.12 (255 at `ONE` = 1.0).
+   For point lights, intensity is multiplied by the falloff first. A point
+   light at distance ≥ `radius` (non-`NONE` falloff) contributes nothing.
+3. Ambient lights, the set's `ambient`, and a point light exactly at the origin
+   go into the back color.
+4. The three directional/point candidates with the largest `r+g+b` fill the
+   GTE light rows and color-matrix columns (`lights_applied`). Each one left
+   over adds a quarter of its color to the back color, which is the average of
+   `max(0, cos)` over all normal directions (`lights_folded`).
+5. The back color clamps at 255 per channel.
+
+Attenuation is evaluated once at the mesh origin, not per vertex or face, so a
+big mesh next to a point light is lit evenly. Split large level geometry into
+several meshes if you need local pools of light.
+
+| Function | Behavior |
+| --- | --- |
+| `void psxe_light_init(psxe_light *l, psxe_light_type type)` | White, intensity `ONE`, enabled, `layers = PSXE_LIGHT_LAYER_DEFAULT` (1), direction `{0,-ONE,0}` (from above), position 0, radius 1024, `PSXE_FALLOFF_LINEAR`. Ignores `NULL`. |
+| `void psxe_light_set_color(psxe_light *l, psxe_color c, int32_t intensity)` | Sets color and intensity (negative = 0). |
+| `void psxe_light_set_direction(psxe_light *l, int32_t x, int32_t y, int32_t z)` | Normalizes any non-zero vector to length `ONE`; zero is ignored. Assigning `direction` directly skips normalization, so keep it unit length. |
+| `void psxe_light_set_position(psxe_light *l, int32_t x, int32_t y, int32_t z)` | Sets the point-light position. |
+| `void psxe_light_set_range(psxe_light *l, int32_t radius, psxe_light_falloff f)` | Sets radius (negative = 0) and falloff curve. |
+| `void psxe_light_set_layers(psxe_light *l, uint8_t layers)` | Layer bits for material masks (`PSXE_LIGHT_LAYER_ALL` = `0xff`). |
+| `void psxe_light_set_enabled(psxe_light *l, bool enabled)` | Toggles the light without removing it. |
+| `void psxe_renderer_clear_lights(psxe_renderer *r)` | Empties the renderer's set and keeps the ambient color. |
+| `bool psxe_renderer_add_light(psxe_renderer *r, const psxe_light *l)` | Copies one light into the set. `false` for `NULL`, or when full (also increments `lights_dropped`). |
+| `uint16_t psxe_renderer_set_lights(psxe_renderer *r, const psxe_light *lights, uint16_t count)` | Replaces the set with a copy of `lights`. Returns how many were stored; any extra count as dropped. |
+| `psxe_light *psxe_renderer_light(psxe_renderer *r, uint16_t index)` | Mutable access to stored light `index` (for animation), or `NULL`. |
+| `void psxe_renderer_set_ambient(psxe_renderer *r, psxe_color ambient)` | Sets the set-wide ambient color. |
+| `void psxe_draw_mesh_lights(psxe_renderer *r, const psxe_mesh *m, const psxe_transform *t, const psxe_material *mat, const psxe_light *extra, uint16_t extra_count)` | `psxe_draw_mesh_material` that also ranks `extra` world-space lights next to the renderer's set. `extra` is borrowed for this call only. `psxe_scene_render` uses it for entity lights. |
+| `void psxe_draw_light_marker(psxe_renderer *r, const psxe_light *l, int16_t size)` | Debug: a solid `size`×`size` square in the light's color at an enabled point light's projected position, in bucket 1 (above meshes). Projected on the CPU with the current camera; skipped behind the camera. Costs one `TILE`. |
+
+The light set is copied by value. Render-target passes save it at
+`psxe_render_target_begin` and restore it at `end`, so a pass can install its
+own lights. The light counters on `psxe_renderer` are summed over every lit
+mesh draw in the frame, so the same light counts once for each mesh it reaches.
+
+```c
+psxe_light sun, torch;
+
+psxe_light_init(&sun, PSXE_LIGHT_DIRECTIONAL);
+psxe_light_set_direction(&sun, -ONE, -ONE, -ONE / 2);
+psxe_light_set_color(&sun, (psxe_color){ 110, 130, 190 }, ONE);
+
+psxe_light_init(&torch, PSXE_LIGHT_POINT);
+psxe_light_set_position(&torch, 0, -150, 900);
+psxe_light_set_color(&torch, (psxe_color){ 255, 180, 80 }, ONE + ONE / 2);
+psxe_light_set_range(&torch, 700, PSXE_FALLOFF_SMOOTH);
+psxe_light_set_layers(&torch, 0x02);           /* "world only" layer */
+
+psxe_renderer_clear_lights(&engine->renderer);
+psxe_renderer_add_light(&engine->renderer, &sun);
+psxe_renderer_add_light(&engine->renderer, &torch);
+psxe_renderer_set_ambient(&engine->renderer, (psxe_color){ 40, 40, 52 });
+
+/* The held item ignores the torch but still gets the sun. */
+psxe_material_set_light_exclude(&held_item.material, 0x02);
 ```
 
 ## Objects — `psxe_object`
@@ -555,7 +667,8 @@ Rules and costs:
   some frames (for example every other frame) to halve the cost: VRAM keeps the
   last image.
 - **Camera.** Call `psxe_renderer_set_camera` after `begin` for the pass's own
-  view; `end` restores the main camera. Lights are **not** saved or restored.
+  view; `end` restores the main camera. The light set is saved at `begin` and
+  restored at `end`, so lights you set inside the pass apply to it only.
 - **Depth.** Mesh faces need `depth = avgZ >> depth_shift` in `[2, ot_length)`;
   a short table with a small shift rejects distant faces.
 - **Transparency.** Texel value `0x0000` (pure black after 5-bit conversion) is
@@ -605,15 +718,25 @@ typedef struct psxe_entity_id { uint16_t index; uint16_t generation; } psxe_enti
 typedef struct psxe_entity {
     psxe_transform transform;
     const psxe_mesh *mesh;     /* NULL = not drawn */
-    psxe_material material;    /* texture/color/effect override, default on create */
+    psxe_material material;    /* texture/color/effect/light-mask override */
     uint16_t generation;
+    uint8_t light_slot;        /* internal; use psxe_scene_light */
     bool active;
     bool visible;
 } psxe_entity;
 
+typedef struct psxe_scene_light_slot {
+    psxe_light light;          /* position/direction are entity-local */
+    uint16_t owner;
+    bool used;
+} psxe_scene_light_slot;
+
 typedef struct psxe_scene {
     psxe_entity entities[PSXE_MAX_ENTITIES];
+    psxe_scene_light_slot lights[PSXE_MAX_SCENE_LIGHTS];
     uint16_t active_count;
+    uint16_t light_count;
+    uint16_t lights_dropped;   /* set_light calls rejected because the pool was full */
 } psxe_scene;
 ```
 
@@ -628,7 +751,12 @@ the slot is reused.
 | `bool psxe_scene_destroy(psxe_scene *scene, psxe_entity_id id)` | Frees the slot and invalidates the handle. `false` for stale/invalid handles. |
 | `psxe_entity *psxe_scene_get(psxe_scene *scene, psxe_entity_id id)` | Mutable entity, or `NULL` for a stale/invalid handle. |
 | `const psxe_entity *psxe_scene_get_const(const psxe_scene *scene, psxe_entity_id id)` | Read-only variant. |
-| `void psxe_scene_render(const psxe_scene *scene, psxe_renderer *renderer)` | Calls `psxe_draw_mesh_material` with the entity's `material` for each active, visible entity with a mesh, in slot order. Inside a render-target pass it draws into the target. |
+| `void psxe_scene_render(const psxe_scene *scene, psxe_renderer *renderer)` | Gathers the scene's entity lights once (`psxe_scene_gather_lights`), then calls `psxe_draw_mesh_lights` with the entity's `material` and those lights for each active, visible entity with a mesh, in slot order. Inside a render-target pass it draws into the target. |
+| `bool psxe_scene_set_light(psxe_scene *scene, psxe_entity_id id, const psxe_light *light)` | Attaches a copy of `light` to the entity, or replaces its existing one. `position` is an offset and `direction` a local direction: both follow the entity's position and rotation (scale is ignored). `false` for stale handles, `NULL`, or a full pool (increments `scene->lights_dropped`). |
+| `bool psxe_scene_clear_light(psxe_scene *scene, psxe_entity_id id)` | Detaches and frees the entity's light. `false` if it had none. `psxe_scene_destroy` does this for you, so stale handles never leave a light behind. |
+| `psxe_light *psxe_scene_light(psxe_scene *scene, psxe_entity_id id)` | Mutable entity-local light (toggle `enabled`, change color), or `NULL`. |
+| `bool psxe_scene_light_world(const psxe_scene *scene, psxe_entity_id id, psxe_light *out)` | Writes the light transformed to world space (for `psxe_draw_light_marker` or gameplay). |
+| `uint16_t psxe_scene_gather_lights(const psxe_scene *scene, psxe_light *out, uint16_t capacity)` | Writes the world-space lights of every active entity whose light is enabled, whether or not its mesh is visible, and returns the count. Pass the result to `psxe_draw_mesh_lights` so objects outside the scene get the same lights. |
 
 ```c
 psxe_entity_id id = psxe_scene_create(&scene);
@@ -638,8 +766,13 @@ if (e != NULL) {
     e->transform.position.vz = 900;
     psxe_material_set_texture(&e->material, &crate_tex);   /* per-entity texture */
 }
+/* a lamp that carries its own point light */
+psxe_light bulb;
+psxe_light_init(&bulb, PSXE_LIGHT_POINT);
+psxe_light_set_range(&bulb, 600, PSXE_FALLOFF_LINEAR);
+psxe_scene_set_light(&scene, id, &bulb);   /* follows e->transform */
 /* later */
-psxe_scene_destroy(&scene, id);
+psxe_scene_destroy(&scene, id);            /* also frees the light */
 /* psxe_scene_get(&scene, id) now returns NULL */
 ```
 
@@ -949,8 +1082,8 @@ entity needed.
 
 ### 5. Per-object lighting in one frame
 
-Lighting is computed during `psxe_draw_mesh`, so changing the light between
-draws gives each object its own light. This works for a dark interior next to a
+Lighting is selected and installed during each mesh draw, so changing the
+light set between draws gives each object its own lights. This works for a dark interior next to a
 lit exterior, a damage flash, or a highlighted selection.
 
 ```c
@@ -974,7 +1107,9 @@ static void lit_render(psxe_engine *engine, my_game *g) {
 ```
 
 A day/night cycle is the same idea spread over time: interpolate `color` and
-`ambient` from `engine->frame` once per frame before drawing.
+`ambient` from `engine->frame` once per frame before drawing. For lights that
+belong to only some geometry, prefer `psxe_light.layers` with
+`psxe_material.light_exclude` over swapping light sets mid-frame.
 
 ### 6. Pause menu: input edges + semitransparent UI + audio
 
@@ -1221,18 +1356,19 @@ STP note above).
 | --- | --- |
 | `types.h` | `psxe_transform_identity` |
 | `engine.h` | `psxe_engine_init`, `psxe_engine_run`, `psxe_engine_stop` |
-| `render.h` (core) | `psxe_renderer_init`, `psxe_renderer_begin_frame`, `psxe_renderer_end_frame`, `psxe_renderer_set_camera`, `psxe_renderer_set_directional_light`, `psxe_texture_load_tim`, `psxe_draw_mesh`, `psxe_draw_mesh_material`, `psxe_draw_sprite`, `psxe_ui_panel`, `psxe_ui_text` |
-| `render.h` (materials) | `psxe_material_default`, `psxe_material_set_texture`, `psxe_material_set_color`, `psxe_material_set_effects` |
+| `render.h` (core) | `psxe_renderer_init`, `psxe_renderer_begin_frame`, `psxe_renderer_end_frame`, `psxe_renderer_set_camera`, `psxe_renderer_set_directional_light`, `psxe_texture_load_tim`, `psxe_draw_mesh`, `psxe_draw_mesh_material`, `psxe_draw_mesh_lights`, `psxe_draw_sprite`, `psxe_ui_panel`, `psxe_ui_text` |
+| `render.h` (materials) | `psxe_material_default`, `psxe_material_set_texture`, `psxe_material_set_color`, `psxe_material_set_effects`, `psxe_material_set_light_exclude` |
+| `render.h` (lights) | `psxe_light_init`, `psxe_light_set_color`, `psxe_light_set_direction`, `psxe_light_set_position`, `psxe_light_set_range`, `psxe_light_set_layers`, `psxe_light_set_enabled`, `psxe_renderer_clear_lights`, `psxe_renderer_add_light`, `psxe_renderer_set_lights`, `psxe_renderer_light`, `psxe_renderer_set_ambient`, `psxe_draw_light_marker` |
 | `render.h` (objects) | `psxe_object_init`, `psxe_object_set_mesh`, `psxe_object_set_texture`, `psxe_object_set_color`, `psxe_object_set_effects`, `psxe_object_set_position`, `psxe_object_translate`, `psxe_object_set_rotation`, `psxe_object_rotate`, `psxe_object_set_scale`, `psxe_object_draw` |
 | `render.h` (sprites) | `psxe_sprite_init`, `psxe_sprite_set_texture`, `psxe_sprite_set_region`, `psxe_sprite_set_position`, `psxe_sprite_move`, `psxe_sprite_set_size`, `psxe_sprite_set_color`, `psxe_sprite_set_effects`, `psxe_sprite_set_layer`, `psxe_sprite_draw` |
 | `render.h` (render to texture) | `psxe_render_target_init`, `psxe_render_target_begin`, `psxe_render_target_end`, `psxe_render_target_texture` |
-| `scene.h` | `psxe_scene_init`, `psxe_scene_create`, `psxe_scene_destroy`, `psxe_scene_get`, `psxe_scene_get_const`, `psxe_scene_render` |
+| `scene.h` | `psxe_scene_init`, `psxe_scene_create`, `psxe_scene_destroy`, `psxe_scene_get`, `psxe_scene_get_const`, `psxe_scene_render`, `psxe_scene_set_light`, `psxe_scene_clear_light`, `psxe_scene_light`, `psxe_scene_light_world`, `psxe_scene_gather_lights` |
 | `input.h` | `psxe_input_init`, `psxe_input_poll`, `psxe_input_pad`, `psxe_button_held`, `psxe_button_pressed`, `psxe_button_released` |
 | `audio.h` | `psxe_audio_init`, `psxe_audio_upload_vag`, `psxe_audio_play`, `psxe_audio_stop`, `psxe_audio_stop_all` |
 | `memory_card.h` | `psxe_memory_card_init`, `psxe_memory_card_save`, `psxe_memory_card_load`, `psxe_memory_card_result_string` |
 
 Not available yet (see [`ROADMAP.md`](ROADMAP.md)): near-plane clipping,
-Gouraud shading, fog, sprite rotation, double-buffered or paletted render
+Gouraud shading and per-vertex lighting, light-radius debug draw, fog, sprite rotation, double-buffered or paletted render
 targets, a VRAM allocator, animation, collision, VRAM/SPU allocators with reclaim,
 voice status, streaming audio, asynchronous or listable card operations,
 rumble, and multitap.

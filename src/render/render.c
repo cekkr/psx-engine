@@ -137,6 +137,10 @@ void psxe_renderer_begin_frame(psxe_renderer *renderer) {
     renderer->submitted_primitives = 0;
     renderer->dropped_primitives = 0;
     renderer->target_passes = 0;
+    renderer->lights_considered = 0;
+    renderer->lights_applied = 0;
+    renderer->lights_folded = 0;
+    renderer->lights_dropped = 0;
 }
 
 void psxe_renderer_end_frame(psxe_renderer *renderer) {
@@ -176,25 +180,6 @@ void psxe_renderer_set_camera(psxe_renderer *renderer, const psxe_camera *camera
     }
     renderer->camera = *camera;
     gte_SetGeomScreen(camera->projection);
-}
-
-void psxe_renderer_set_directional_light(
-    psxe_renderer *renderer,
-    const SVECTOR *direction,
-    psxe_color color,
-    psxe_color ambient
-) {
-    memset(&renderer->light_matrix, 0, sizeof(renderer->light_matrix));
-    memset(&renderer->color_matrix, 0, sizeof(renderer->color_matrix));
-
-    renderer->light_matrix.m[0][0] = direction->vx;
-    renderer->light_matrix.m[0][1] = direction->vy;
-    renderer->light_matrix.m[0][2] = direction->vz;
-    renderer->color_matrix.m[0][0] = (int16_t)(((int32_t)color.r * ONE) / 255);
-    renderer->color_matrix.m[1][0] = (int16_t)(((int32_t)color.g * ONE) / 255);
-    renderer->color_matrix.m[2][0] = (int16_t)(((int32_t)color.b * ONE) / 255);
-    gte_SetBackColor(ambient.r, ambient.g, ambient.b);
-    gte_SetColorMatrix(&renderer->color_matrix);
 }
 
 bool psxe_texture_load_tim(psxe_texture *texture, const uint32_t *tim_data) {
@@ -249,11 +234,33 @@ void psxe_draw_mesh_material(
     const psxe_transform *transform,
     const psxe_material *material
 ) {
+    psxe_draw_mesh_lights(renderer, mesh, transform, material, NULL, 0);
+}
+
+static int32_t psxe_back_channel(int32_t value) {
+    /* gte_SetBackColor takes 0..255 and shifts left by 4 (255 -> ~1.0). */
+    if (value <= 0) {
+        return 0;
+    }
+    return (value >= 4095) ? 255 : (value >> 4);
+}
+
+void psxe_draw_mesh_lights(
+    psxe_renderer *renderer,
+    const psxe_mesh *mesh,
+    const psxe_transform *transform,
+    const psxe_material *material,
+    const psxe_light *extra_lights,
+    uint16_t extra_count
+) {
     MATRIX object_rotation;
     MATRIX view_object;
     MATRIX object_light;
+    psxe_light_state light_state;
+    bool may_light;
     const psxe_texture *texture;
     uint8_t effects = 0;
+    uint8_t light_exclude = 0;
     uint8_t blend = PSXE_BLEND_HALF;
     uint16_t tpage = 0;
     bool can_texture;
@@ -267,6 +274,7 @@ void psxe_draw_mesh_material(
     texture = mesh->texture;
     if (material != NULL) {
         effects = material->effects;
+        light_exclude = material->light_exclude;
         blend = (uint8_t)(material->blend & 3u);
         if (material->texture != NULL) {
             texture = material->texture;
@@ -277,11 +285,32 @@ void psxe_draw_mesh_material(
         tpage = psxe_tpage_with_blend(texture->tpage, blend);
     }
 
+    /* Light selection and the matrix helpers below may use GTE registers, so
+     * all of them run before this mesh's GTE state is installed. Meshes that
+     * cannot light a face skip selection entirely. */
+    may_light = !(effects & PSXE_EFFECT_UNLIT) && (mesh->normals != NULL) && (mesh->normal_count > 0u);
+    if (may_light) {
+        psxe_light_select(
+            renderer, &transform->position, light_exclude, extra_lights, extra_count, &light_state
+        );
+    }
     psxe_make_object_matrix(renderer, transform, &object_rotation, &view_object);
-    MulMatrix0(&renderer->light_matrix, &object_rotation, &object_light);
+    if (may_light) {
+        /* World-space rows times the object rotation give object-space rows,
+         * which is what NCCS dots against untransformed mesh normals. */
+        MulMatrix0(&light_state.light, &object_rotation, &object_light);
+    }
     gte_SetRotMatrix(&view_object);
     gte_SetTransMatrix(&view_object);
-    gte_SetLightMatrix(&object_light);
+    if (may_light) {
+        gte_SetLightMatrix(&object_light);
+        gte_SetColorMatrix(&light_state.color);
+        gte_SetBackColor(
+            psxe_back_channel(light_state.back[0]),
+            psxe_back_channel(light_state.back[1]),
+            psxe_back_channel(light_state.back[2])
+        );
+    }
 
     for (face_index = 0; face_index < mesh->face_count; ++face_index) {
         const psxe_face *face = &mesh->faces[face_index];
@@ -325,8 +354,7 @@ void psxe_draw_mesh_material(
         bucket = &renderer->ordering_table[depth];
 
         textured = can_texture && (flags & PSXE_MATERIAL_TEXTURED);
-        lit = (flags & PSXE_MATERIAL_LIT) && !(effects & PSXE_EFFECT_UNLIT) &&
-              (mesh->normals != NULL) && (face->normal < mesh->normal_count);
+        lit = may_light && (flags & PSXE_MATERIAL_LIT) && (face->normal < mesh->normal_count);
         semitransparent = (flags & PSXE_MATERIAL_SEMITRANSPARENT) ||
                           (effects & PSXE_EFFECT_SEMITRANSPARENT);
         color = psxe_resolve_color(face->color, material);

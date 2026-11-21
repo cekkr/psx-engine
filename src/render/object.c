@@ -12,6 +12,7 @@ psxe_material psxe_material_default(void) {
     material.color_mode = PSXE_COLOR_FACE;
     material.effects = 0;
     material.blend = PSXE_BLEND_HALF;
+    material.light_exclude = 0;
     return material;
 }
 
@@ -32,6 +33,12 @@ void psxe_material_set_effects(psxe_material *material, uint8_t effects, psxe_bl
     if (material != NULL) {
         material->effects = effects;
         material->blend = (uint8_t)(blend & 3);
+    }
+}
+
+void psxe_material_set_light_exclude(psxe_material *material, uint8_t layers) {
+    if (material != NULL) {
+        material->light_exclude = layers;
     }
 }
 

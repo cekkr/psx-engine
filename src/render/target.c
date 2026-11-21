@@ -156,6 +156,7 @@ bool psxe_render_target_begin(psxe_renderer *renderer, const psxe_render_target 
 
     renderer->active_target = target;
     renderer->saved_camera = renderer->camera;
+    renderer->saved_lights = renderer->lights;
     renderer->saved_depth_shift = renderer->depth_shift;
     renderer->ordering_table = ordering_table;
     renderer->ot_length = target->ot_length;
@@ -173,6 +174,7 @@ void psxe_render_target_end(psxe_renderer *renderer) {
     renderer->ot_length = PSXE_OT_LENGTH;
     renderer->depth_shift = renderer->saved_depth_shift;
     renderer->active_target = NULL;
+    renderer->lights = renderer->saved_lights;
     gte_SetGeomOffset(renderer->width / 2, renderer->height / 2);
     psxe_renderer_set_camera(renderer, &renderer->saved_camera);
 }

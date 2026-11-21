@@ -9,9 +9,13 @@ The current milestone supplies the reusable frame loop and the low-level pieces
 needed to grow complete games without hiding the console's constraints:
 
 - fixed-capacity scene entities and transforms;
-- GTE-accelerated triangle projection, back-face rejection, directional
+- GTE-accelerated triangle projection, back-face rejection, flat per-face
   lighting, affine textured or colored materials, ordering-table depth sorting,
   double buffering, and GPU dithering;
+- light objects: directional, point (CPU distance falloff), and ambient
+  lights in a fixed-capacity renderer set and as entity-owned scene lights;
+  the best three per mesh fill the GTE light rows, the rest fold into ambient,
+  and material light masks opt geometry out;
 - per-object/per-sprite materials: texture swaps, replace/tint colors, unlit
   and untextured shortcuts, and the four GPU blend modes, with no extra GTE
   work;
@@ -75,6 +79,10 @@ integration example.
 - Circle swaps which of two render targets the spinning screen and the
   preview sprite show.
 - Triangle mirrors the preview sprite.
+- Square cycles the ambient color (cool, dark, warm).
+- L1 toggles the orbiting lamp's point light; R1 toggles its debug marker.
+  The bottom HUD line shows lights considered/applied/folded/dropped this frame.
+  Render target B uses its own green light set for the pass.
 - Start writes its rotation to memory-card slot 1.
 - Select restores the saved rotation.
 

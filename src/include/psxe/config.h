@@ -14,6 +14,23 @@
 #define PSXE_MAX_ENTITIES 128
 #endif
 
+/* Lights held by the renderer's light set (psxe_renderer_add_light). */
+#ifndef PSXE_MAX_LIGHTS
+#define PSXE_MAX_LIGHTS 8
+#endif
+
+/* Lights that scene entities can own at once (psxe_scene_set_light). */
+#ifndef PSXE_MAX_SCENE_LIGHTS
+#define PSXE_MAX_SCENE_LIGHTS 8
+#endif
+
+#if (PSXE_MAX_LIGHTS < 1) || (PSXE_MAX_LIGHTS > 255)
+#error "PSXE_MAX_LIGHTS must be in 1..255"
+#endif
+#if (PSXE_MAX_SCENE_LIGHTS < 1) || (PSXE_MAX_SCENE_LIGHTS > 254)
+#error "PSXE_MAX_SCENE_LIGHTS must be in 1..254"
+#endif
+
 #ifndef PSXE_MEMORY_CARD_BLOCK_SIZE
 #define PSXE_MEMORY_CARD_BLOCK_SIZE 8192
 #endif
