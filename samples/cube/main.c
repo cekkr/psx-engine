@@ -16,6 +16,13 @@ typedef struct cube_game {
     psxe_object mini_cube;     /* drawn only inside the render targets */
     psxe_object screen;        /* quad textured with a render target */
     psxe_sprite preview;       /* scaled 2D view of the same target */
+    psxe_heap heap;
+    uint32_t asset_ram[512];
+    psxe_mesh_storage *painted_mesh;
+    psxe_vram vram;
+    psxe_vram_id paint;
+    psxe_texture palette;
+    psxe_audio_sample chime;
     unsigned int shown_target;
     unsigned int effect;
     unsigned int ambient;
@@ -84,10 +91,10 @@ static const psxe_mesh quad_mesh = {
 };
 
 static const char *const effect_names[] = {
-    "NORMAL", "TINT RED", "UNLIT", "ADD BLEND", "FLAT WHITE"
+    "NORMAL", "TINT RED", "UNLIT", "ADD BLEND", "FLAT WHITE", "BAKED WARM", "BAKED COOL"
 };
 
-static void apply_effect(psxe_entity *entity, unsigned int effect) {
+static void apply_effect(cube_game *game, psxe_entity *entity, unsigned int effect) {
     psxe_material *material = &entity->material;
 
     *material = psxe_material_default();
@@ -105,9 +112,73 @@ static void apply_effect(psxe_entity *entity, unsigned int effect) {
         psxe_material_set_color(material, (psxe_color){ 255, 255, 255 }, PSXE_COLOR_REPLACE);
         psxe_material_set_effects(material, PSXE_EFFECT_UNLIT, PSXE_BLEND_HALF);
         break;
+    case 5:
+    case 6:
+        if (psxe_vram_palette(&game->vram, game->paint, effect - 5u, &game->palette)) {
+            psxe_material_set_texture(material, &game->palette);
+            psxe_material_set_effects(material, PSXE_EFFECT_UNLIT | PSXE_EFFECT_RAW_TEXTURE, PSXE_BLEND_HALF);
+        }
+        break;
     default:
         break;
     }
+}
+
+static void load_assets(cube_game *game, psxe_engine *engine, psxe_entity *entity) {
+    psxe_cd_file file;
+    void *staging;
+    bool paint_ready = false;
+
+    psxe_heap_init(&game->heap, game->asset_ram, sizeof(game->asset_ram));
+    psxe_vram_init(&game->vram, &engine->renderer);
+    for (unsigned int i = 0; i < 2; ++i) {
+        const psxe_render_target *target = &game->targets[i];
+        if (!psxe_vram_reserve(&game->vram, target->x, target->y, target->width, target->height)) {
+            return;
+        }
+    }
+    if (psxe_cd_init() != PSXE_CD_OK) {
+        return;
+    }
+    if (psxe_cd_find("/ASSETS/PAINTED.TIM", &file) == PSXE_CD_OK) {
+        staging = psxe_heap_alloc(&game->heap, file.size);
+        if (staging != NULL) {
+            paint_ready = (psxe_cd_read_file(&file, 0, staging, file.size) == PSXE_CD_OK) &&
+                          psxe_vram_load_tim(&game->vram, staging, file.size, &game->paint);
+            psxe_heap_free(&game->heap, staging);
+        }
+    }
+    if (psxe_cd_find("/ASSETS/CHIME.VAG", &file) == PSXE_CD_OK) {
+        staging = psxe_heap_alloc(&game->heap, file.size);
+        if (staging != NULL) {
+            psxe_audio_load_vag(&engine->audio, &game->chime, &file, staging, file.size);
+            psxe_heap_free(&game->heap, staging);
+        }
+    }
+    if (!paint_ready) {
+        return;
+    }
+
+    game->painted_mesh = psxe_mesh_alloc(&game->heap, cube_mesh.vertex_count, cube_mesh.normal_count,
+                                       cube_mesh.face_count);
+    if (game->painted_mesh == NULL) {
+        psxe_vram_free(&game->vram, game->paint);
+        return;
+    }
+    memcpy(game->painted_mesh->vertices, cube_vertices, sizeof(cube_vertices));
+    memcpy(game->painted_mesh->normals, cube_normals, sizeof(cube_normals));
+    memcpy(game->painted_mesh->faces, cube_faces, sizeof(cube_faces));
+    for (unsigned int i = 0; i < cube_mesh.face_count; ++i) {
+        static const uint8_t uv[2][3][2] = {
+            { { 0, 0 }, { 31, 0 }, { 0, 31 } }, { { 31, 0 }, { 31, 31 }, { 0, 31 } }
+        };
+        psxe_face *face = &game->painted_mesh->faces[i];
+        memcpy(face->uv, uv[i & 1u], sizeof(face->uv));
+        face->flags |= PSXE_MATERIAL_TEXTURED;
+    }
+    entity->mesh = &game->painted_mesh->mesh;
+    game->effect = 5;
+    apply_effect(game, entity, game->effect);
 }
 
 static const psxe_color ambient_presets[] = {
@@ -216,6 +287,7 @@ static void game_init(psxe_engine *engine, void *user_data) {
     psxe_sprite_set_size(&game->preview, 64, 64);
     psxe_sprite_set_color(&game->preview, (psxe_color){ 128, 128, 128 });
     show_target(game, 0);
+    load_assets(game, engine, entity);
 
     snprintf(game->status, sizeof(game->status), "START: SAVE  SELECT: LOAD");
 }
@@ -232,8 +304,11 @@ static void game_update(psxe_engine *engine, void *user_data) {
     update_lamp(game);
 
     if (psxe_button_pressed(pad, PAD_CROSS)) {
-        game->effect = (game->effect + 1u) % (unsigned int)PSXE_ARRAY_COUNT(effect_names);
-        apply_effect(entity, game->effect);
+        unsigned int effect_count = game->painted_mesh ? PSXE_ARRAY_COUNT(effect_names) : 5u;
+        game->effect = (game->effect + 1u) % effect_count;
+        apply_effect(game, entity, game->effect);
+        psxe_input_rumble(&engine->input, 0, true, 100, 8);
+        psxe_audio_play(&engine->audio, &game->chime, 0x2400, 0);
         snprintf(game->status, sizeof(game->status), "EFFECT: %s", effect_names[game->effect]);
     }
     if (psxe_button_pressed(pad, PAD_CIRCLE)) {
@@ -257,6 +332,15 @@ static void game_update(psxe_engine *engine, void *user_data) {
     }
     if (psxe_button_pressed(pad, PAD_R1)) {
         game->show_markers = !game->show_markers;
+    }
+    if (psxe_button_pressed(pad, PAD_R2)) {
+        unsigned int free_blocks;
+        psxe_memory_card_result result = psxe_memory_card_list(0, NULL, 0, NULL, &free_blocks);
+        if (result == PSXE_MEMORY_CARD_OK) {
+            snprintf(game->status, sizeof(game->status), "CARD: %u BLOCKS FREE", free_blocks);
+        } else {
+            snprintf(game->status, sizeof(game->status), "CARD: %s", psxe_memory_card_result_string(result));
+        }
     }
 
     if (psxe_button_held(pad, PAD_LEFT)) {
@@ -359,6 +443,19 @@ static void game_render(psxe_engine *engine, void *user_data) {
     psxe_ui_text(&engine->renderer, 10, 218, diagnostics);
 }
 
+static void game_shutdown(psxe_engine *engine, void *user_data) {
+    cube_game *game = user_data;
+    psxe_entity *entity = psxe_scene_get(&game->scene, game->cube);
+    (void)engine;
+    entity->mesh = &cube_mesh;
+    entity->material = psxe_material_default();
+    if (game->painted_mesh != NULL) {
+        psxe_mesh_free(&game->heap, game->painted_mesh);
+        psxe_vram_free(&game->vram, game->paint);
+    }
+    psxe_cd_stop();
+}
+
 int main(void) {
     static psxe_engine engine;
     static cube_game state;
@@ -381,7 +478,7 @@ int main(void) {
         .init = game_init,
         .update = game_update,
         .render = game_render,
-        .shutdown = NULL,
+        .shutdown = game_shutdown,
         .user_data = &state
     };
 

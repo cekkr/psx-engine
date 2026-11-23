@@ -47,7 +47,8 @@ typedef enum psxe_effect_flags {
     PSXE_EFFECT_SEMITRANSPARENT = 1 << 2, /* blend everything with material.blend */
     PSXE_EFFECT_DOUBLE_SIDED = 1 << 3,    /* disable back-face rejection */
     PSXE_EFFECT_FLIP_X = 1 << 4,          /* sprites only: mirror horizontally */
-    PSXE_EFFECT_FLIP_Y = 1 << 5           /* sprites only: mirror vertically */
+    PSXE_EFFECT_FLIP_Y = 1 << 5,          /* sprites only: mirror vertically */
+    PSXE_EFFECT_RAW_TEXTURE = 1 << 6      /* textured draws use baked texel colors */
 } psxe_effect_flags;
 
 /* Light kinds. Only DIRECTIONAL and POINT occupy one of the three GTE light
@@ -215,6 +216,7 @@ typedef struct psxe_renderer {
     uint32_t lights_folded;     /* beyond three rows, approximated in back color */
     uint32_t lights_dropped;    /* rejected because a light set was full */
     bool dither;
+    bool frame_open; /* Managed VRAM changes are allowed between frames. */
     /* Current destination ordering table (main buffer or a render target). */
     uint32_t *ordering_table;
     uint16_t ot_length;

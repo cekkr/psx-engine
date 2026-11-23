@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "psxe/cd.h"
 #include "psxe/config.h"
 
 typedef struct psxe_audio_sample {
@@ -25,6 +26,11 @@ bool psxe_audio_upload_vag(
     psxe_audio_sample *sample,
     const void *vag_data,
     size_t vag_size
+);
+/* Load a mono VAG from an ISO file using caller-owned staging RAM. */
+psxe_cd_result psxe_audio_load_vag(
+    psxe_audio *audio, psxe_audio_sample *sample, const psxe_cd_file *file,
+    void *scratch, size_t capacity
 );
 int psxe_audio_play(
     psxe_audio *audio,

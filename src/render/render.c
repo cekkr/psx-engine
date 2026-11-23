@@ -134,6 +134,7 @@ void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *confi
 }
 
 void psxe_renderer_begin_frame(psxe_renderer *renderer) {
+    renderer->frame_open = true;
     renderer->submitted_primitives = 0;
     renderer->dropped_primitives = 0;
     renderer->target_passes = 0;
@@ -172,6 +173,7 @@ void psxe_renderer_end_frame(psxe_renderer *renderer) {
     renderer->ordering_table = display_buffer->ordering_table;
     renderer->ot_length = PSXE_OT_LENGTH;
     ClearOTagR(display_buffer->ordering_table, PSXE_OT_LENGTH);
+    renderer->frame_open = false;
 }
 
 void psxe_renderer_set_camera(psxe_renderer *renderer, const psxe_camera *camera) {
@@ -264,6 +266,7 @@ void psxe_draw_mesh_lights(
     uint8_t blend = PSXE_BLEND_HALF;
     uint16_t tpage = 0;
     bool can_texture;
+    bool raw_texture;
     uint16_t face_index;
 
     if ((renderer == NULL) || (mesh == NULL) || (transform == NULL) ||
@@ -281,6 +284,7 @@ void psxe_draw_mesh_lights(
         }
     }
     can_texture = (texture != NULL) && texture->valid && !(effects & PSXE_EFFECT_UNTEXTURED);
+    raw_texture = (effects & PSXE_EFFECT_RAW_TEXTURE) != 0;
     if (can_texture) {
         tpage = psxe_tpage_with_blend(texture->tpage, blend);
     }
@@ -357,7 +361,8 @@ void psxe_draw_mesh_lights(
         lit = may_light && (flags & PSXE_MATERIAL_LIT) && (face->normal < mesh->normal_count);
         semitransparent = (flags & PSXE_MATERIAL_SEMITRANSPARENT) ||
                           (effects & PSXE_EFFECT_SEMITRANSPARENT);
-        color = psxe_resolve_color(face->color, material);
+        color = (textured && raw_texture) ? (psxe_color){ 128, 128, 128 } :
+                psxe_resolve_color(face->color, material);
 
         if (textured) {
             POLY_FT3 *primitive = psxe_renderer_allocate(renderer, sizeof(*primitive));
@@ -365,6 +370,9 @@ void psxe_draw_mesh_lights(
                 continue;
             }
             setPolyFT3(primitive);
+            if (raw_texture) {
+                setShadeTex(primitive, 1);
+            }
             setRGB0(primitive, color.r, color.g, color.b);
             gte_stsxy0(&primitive->x0);
             gte_stsxy1(&primitive->x1);
@@ -378,7 +386,7 @@ void psxe_draw_mesh_lights(
             /* The textured primitive carries its own page and blend mode. */
             primitive->tpage = tpage;
             primitive->clut = texture->clut;
-            if (lit) {
+            if (lit && !raw_texture) {
                 gte_ldrgb(&primitive->r0);
                 gte_ldv0(&mesh->normals[face->normal]);
                 gte_nccs();

@@ -15,6 +15,10 @@
       <file name="PSXE_CUB.EXE" type="data" source="psxe_cube.exe" />
       <file name="README.TXT" type="data" source="${PROJECT_SOURCE_DIR}/README.md" />
       <file name="LICENSE.TXT" type="data" source="${PROJECT_SOURCE_DIR}/LICENSE" />
+      <dir name="ASSETS" source="${CMAKE_CURRENT_SOURCE_DIR}/assets">
+        <file name="PAINTED.TIM" type="data" source="${CMAKE_CURRENT_SOURCE_DIR}/assets/painted.tim" />
+        <file name="CHIME.VAG" type="data" source="${CMAKE_CURRENT_SOURCE_DIR}/assets/chime.vag" />
+      </dir>
       <dummy sectors="256" />
     </directory_tree>
   </track>

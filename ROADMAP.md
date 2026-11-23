@@ -42,8 +42,10 @@ behavior.
   blend modes), `psxe_object`/`psxe_sprite` structs with atlas regions,
   scaling, flipping, and layers, and single-buffered render-to-texture passes.
 - [x] Two-port pad snapshots with held/pressed/released states and analog axes.
-- [x] In-memory VAG upload and 24-channel SPU playback.
-- [x] Versioned, CRC-protected, one-block memory-card save/load API.
+- [x] DualShock motor negotiation, reconnect handling, and timed rumble.
+- [x] Resident VAG upload from memory or disc and 24-channel SPU playback.
+- [x] Versioned, CRC-protected, one-block memory-card saves in both slots,
+  with status, directory/free-block queries, and deletion.
 - [ ] Run emulator regression captures and original-hardware tests for every
   shipped-looking feature above; until then this milestone remains experimental.
 
@@ -87,8 +89,10 @@ automated emulator smoke tests pass, and capacity failures are observable.
   prepare XA-ADPCM and CD-DA tracks with explicit channel/rate constraints.
 - [ ] Generate C/assembly `incbin` bindings for resident assets and ISO XML/LBA
   manifests for streamed assets.
-- [ ] Implement bounded main-RAM arenas plus explicit VRAM and SPU-RAM allocators
-  with alignment, lifetimes, fragmentation diagnostics, and reset points.
+- [x] Add a bounded main-RAM heap with coalescing and fragmentation counters,
+  a single-allocation mesh store, and a VRAM pool for TIM pixels and CLUTs.
+- [ ] Add SPU-RAM release, VRAM fragmentation diagnostics, and bulk lifetime
+  management for asset bundles.
 - [ ] Document binary formats and add version checks, size limits, corrupted
   input tests, and migration policy before formats are declared stable.
 
@@ -104,6 +108,10 @@ loads without runtime parsing of source formats.
 - [ ] Add flat/Gouraud vertex color and lighting, GTE depth cueing/fog,
   emissive materials, and selectable semi-transparency modes (multiple lights
   and ambient are covered by the light-object work below).
+- [x] Add raw-texture materials for baked color and CLUT variants for
+  palette swaps on meshes and sprites.
+- [ ] Measure raw and modulated material paths on representative scenes and
+  original hardware.
 - [ ] Light objects and scene lighting. Code and target compilation landed;
   emulator captures and measurements remain open, so the parent item stays
   unchecked.
@@ -163,8 +171,10 @@ without packet overflow on original hardware.
   stable handles, tags/layers, lifecycle events, and deterministic iteration.
 - [ ] Add scene/prefab serialization, additive rooms, transition state, persistent
   game state, and a loading-screen contract.
-- [ ] Implement asynchronous CD reads, sector-aligned bundles, room/asset
-  residency, prefetching, cancellation, seek scheduling, and LBA-aware packing.
+- [x] Add ISO9660 lookup and byte-range reads, asynchronous data/raw sector
+  reads and cancellation, LBA seeking, and transport controls.
+- [ ] Add sector-aligned bundles, room/asset residency, prefetching, seek
+  scheduling, and LBA-aware packing.
 - [ ] Add executable/data overlays for games that exceed resident RAM, with a
   link-map and ownership model that prevents dangling pointers across swaps.
 - [ ] Add broad-phase spatial partitioning and simple production collision:
@@ -182,13 +192,15 @@ changes scenes, and survives repeated transitions within RAM budgets.
 
 - [ ] Add priority-based voice allocation, completion tracking, buses, master and
   per-bus volume, pitch, pan, simple distance attenuation, and optional reverb.
-- [ ] Stream long-form XA music/voices from CD and support CD-DA tracks without
-  starving scene streaming; document layout tradeoffs.
-- [ ] Add DualShock mode negotiation, analog dead zones, rumble, reconnect,
-  remapping, multitap/four-player support, and controller-type capability APIs.
+- [x] Add low-level XA playback with filter control and CD-DA playback with
+  track-end auto-pause.
+- [ ] Coordinate long-form audio playback with scene streaming and validate
+  the layout and timing tradeoffs on hardware.
+- [ ] Add analog mode switching, dead zones, remapping, multitap/four-player
+  support, and expanded controller capabilities.
 - [ ] Replace blocking save calls with an explicit state machine, progress UI,
-  cancellation boundaries, card-change detection, free-space/list/delete APIs,
-  backup/journal strategy, and robust full/no-card/unformatted responses.
+  cancellation boundaries, card-change detection, backup/journal strategy,
+  and hardware coverage for full/no-card/unformatted responses.
 - [ ] Support multiple save blocks, BIOS-valid localized titles/icons, animated
   icons, settings/profile slots, migration callbacks, and corruption recovery.
 - [ ] Add UI focus/navigation, menus, modal dialogs, text layout, proportional

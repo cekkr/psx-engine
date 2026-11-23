@@ -29,6 +29,8 @@
 *.vag
 *.xa
 *.str
+!/samples/cube/assets/painted.tim
+!/samples/cube/assets/chime.vag
 
 # Host/editor noise
 .DS_Store

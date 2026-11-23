@@ -11,13 +11,16 @@ option(PSXE_BUILD_SAMPLES "Build bundled sample games" ON)
 
 set(PSXE_SOURCES
     src/core/engine.c
+    src/core/memory.c
     src/core/scene.c
     src/render/render.c
     src/render/object.c
     src/render/sprite.c
     src/render/target.c
     src/render/light.c
+    src/render/vram.c
     src/platform/audio.c
+    src/platform/cd.c
     src/platform/input.c
     src/platform/memory_card.c
 )

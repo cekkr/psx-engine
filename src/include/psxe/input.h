@@ -16,15 +16,23 @@ typedef struct psxe_pad_state {
     uint8_t right_y;
     uint8_t type;
     bool connected;
+    bool rumble_supported;
 } psxe_pad_state;
 
 typedef struct psxe_input {
-    uint8_t buffers[2][34];
     psxe_pad_state pads[2];
+    uint32_t last_poll;
+    uint8_t rumble_retry[2];
+    uint8_t rumble_frames[2];
+    uint8_t small_motor[2];
+    uint8_t large_motor[2];
 } psxe_input;
 
 void psxe_input_init(psxe_input *input);
 void psxe_input_poll(psxe_input *input);
+/* Send motor levels for the next `frames` polls, or stop with frames = 0. */
+bool psxe_input_rumble(psxe_input *input, unsigned int port, bool small, uint8_t large, uint8_t frames);
+void psxe_input_stop_rumble(psxe_input *input);
 const psxe_pad_state *psxe_input_pad(const psxe_input *input, unsigned int port);
 bool psxe_button_held(const psxe_pad_state *pad, PadButton button);
 bool psxe_button_pressed(const psxe_pad_state *pad, PadButton button);

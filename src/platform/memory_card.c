@@ -22,6 +22,8 @@ typedef struct psxe_save_header {
 
 static uint8_t psxe_card_buffer[PSXE_MEMORY_CARD_BLOCK_SIZE] __attribute__((aligned(4)));
 
+static const char *const psxe_card_devices[] = { "bu00:", "bu10:" };
+
 static uint32_t psxe_crc32(const uint8_t *data, size_t size) {
     uint32_t crc = 0xffffffffu;
     size_t index;
@@ -59,7 +61,10 @@ static bool psxe_make_filename(
         return false;
     }
 
-    count = snprintf(output, capacity, "bu%02u:%s%s", slot, config->product_code, config->identifier);
+    if (strpbrk(config->product_code, "*/?:\\") || strpbrk(config->identifier, "*/?:\\")) {
+        return false;
+    }
+    count = snprintf(output, capacity, "%s%s%s", psxe_card_devices[slot], config->product_code, config->identifier);
     return (count > 0) && ((size_t)count < capacity);
 }
 
@@ -97,9 +102,102 @@ static void psxe_write_card_visual_header(const psxe_memory_card_config *config)
 }
 
 void psxe_memory_card_init(void) {
+    /* Leave controller polling to the SIO0 driver. */
     InitCARD(0);
     StartCARD();
+    ChangeClearPAD(0);
     _bu_init();
+}
+
+psxe_memory_card_result psxe_memory_card_status(unsigned int slot) {
+    uint8_t header[128] __attribute__((aligned(4)));
+    int status;
+
+    if (slot > 1) {
+        return PSXE_MEMORY_CARD_INVALID_ARGUMENT;
+    }
+    _new_card();
+    if (!_card_read((int)(slot << 4), 0, header)) {
+        return PSXE_MEMORY_CARD_IO_ERROR;
+    }
+    status = _card_wait((int)slot);
+    if (status == 0x11) {
+        return PSXE_MEMORY_CARD_NO_CARD;
+    }
+    if (status != 1) {
+        return PSXE_MEMORY_CARD_IO_ERROR;
+    }
+    return ((header[0] == 'M') && (header[1] == 'C')) ?
+           PSXE_MEMORY_CARD_OK : PSXE_MEMORY_CARD_UNFORMATTED;
+}
+
+psxe_memory_card_result psxe_memory_card_list(
+    unsigned int slot, psxe_memory_card_file *files, size_t capacity,
+    size_t *count, unsigned int *free_blocks
+) {
+    struct DIRENTRY entry;
+    char pattern[8];
+    size_t found = 0;
+    unsigned int used = 0;
+    psxe_memory_card_result status;
+
+    if ((slot > 1) || ((files == NULL) && capacity)) {
+        return PSXE_MEMORY_CARD_INVALID_ARGUMENT;
+    }
+    status = psxe_memory_card_status(slot);
+    if (status != PSXE_MEMORY_CARD_OK) {
+        return status;
+    }
+    snprintf(pattern, sizeof(pattern), "%s*", psxe_card_devices[slot]);
+    for (struct DIRENTRY *current = firstfile(pattern, &entry); current != NULL;
+         current = nextfile(&entry)) {
+        unsigned int bytes;
+        if ((entry.size <= 0) || (entry.size > PSXE_MEMORY_CARD_MAX_FILES * PSXE_MEMORY_CARD_BLOCK_SIZE)) {
+            return PSXE_MEMORY_CARD_CORRUPT;
+        }
+        bytes = (unsigned int)entry.size;
+        used += (bytes + PSXE_MEMORY_CARD_BLOCK_SIZE - 1u) / PSXE_MEMORY_CARD_BLOCK_SIZE;
+        if (used > PSXE_MEMORY_CARD_MAX_FILES) {
+            return PSXE_MEMORY_CARD_CORRUPT;
+        }
+        if (found < capacity) {
+            memcpy(files[found].name, entry.name, sizeof(entry.name));
+            files[found].name[20] = '\0';
+            files[found].size = bytes;
+        }
+        ++found;
+    }
+    if (count != NULL) {
+        *count = found;
+    }
+    if (free_blocks != NULL) {
+        *free_blocks = PSXE_MEMORY_CARD_MAX_FILES - used;
+    }
+    return PSXE_MEMORY_CARD_OK;
+}
+
+static psxe_memory_card_result psxe_card_file_error(unsigned int slot, int error) {
+    psxe_memory_card_result status;
+    if (error == 0x1c) {
+        return PSXE_MEMORY_CARD_FULL;
+    }
+    status = psxe_memory_card_status(slot);
+    if (status != PSXE_MEMORY_CARD_OK) {
+        return status;
+    }
+    return (error == 2) ? PSXE_MEMORY_CARD_NOT_FOUND : PSXE_MEMORY_CARD_IO_ERROR;
+}
+
+psxe_memory_card_result psxe_memory_card_delete(const psxe_memory_card_config *config, unsigned int slot) {
+    char filename[32];
+
+    if (!psxe_make_filename(filename, sizeof(filename), config, slot)) {
+        return PSXE_MEMORY_CARD_INVALID_ARGUMENT;
+    }
+    if (erase(filename) == 1) {
+        return PSXE_MEMORY_CARD_OK;
+    }
+    return psxe_card_file_error(slot, _get_errno());
 }
 
 psxe_memory_card_result psxe_memory_card_save(
@@ -128,13 +226,17 @@ psxe_memory_card_result psxe_memory_card_save(
     header->payload_crc = psxe_crc32((const uint8_t *)payload, payload_size);
     memcpy((uint8_t *)(header + 1), payload, payload_size);
 
-    descriptor = open(filename, FWRITE | FCREATE | FTRUNC | FNBLOCKS(1));
+    descriptor = open(filename, FWRITE);
+    if ((descriptor < 0) && (_get_errno() == 2)) {
+        descriptor = open(filename, FWRITE | FCREATE | FNBLOCKS(1));
+    }
     if (descriptor < 0) {
-        return PSXE_MEMORY_CARD_IO_ERROR;
+        return psxe_card_file_error(slot, _get_errno());
     }
     written = write(descriptor, psxe_card_buffer, sizeof(psxe_card_buffer));
-    close(descriptor);
-    return (written == (int)sizeof(psxe_card_buffer)) ? PSXE_MEMORY_CARD_OK : PSXE_MEMORY_CARD_IO_ERROR;
+    int closed = close(descriptor);
+    return ((written == (int)sizeof(psxe_card_buffer)) && (closed >= 0)) ?
+           PSXE_MEMORY_CARD_OK : PSXE_MEMORY_CARD_IO_ERROR;
 }
 
 psxe_memory_card_result psxe_memory_card_load(
@@ -157,11 +259,11 @@ psxe_memory_card_result psxe_memory_card_load(
 
     descriptor = open(filename, FREAD);
     if (descriptor < 0) {
-        return PSXE_MEMORY_CARD_NOT_FOUND;
+        return psxe_card_file_error(slot, _get_errno());
     }
     bytes_read = read(descriptor, psxe_card_buffer, sizeof(psxe_card_buffer));
-    close(descriptor);
-    if (bytes_read != (int)sizeof(psxe_card_buffer)) {
+    int closed = close(descriptor);
+    if ((bytes_read != (int)sizeof(psxe_card_buffer)) || (closed < 0)) {
         return PSXE_MEMORY_CARD_IO_ERROR;
     }
 
@@ -197,6 +299,9 @@ const char *psxe_memory_card_result_string(psxe_memory_card_result result) {
         case PSXE_MEMORY_CARD_IO_ERROR: return "CARD I/O ERROR";
         case PSXE_MEMORY_CARD_CORRUPT: return "CORRUPT SAVE";
         case PSXE_MEMORY_CARD_VERSION_MISMATCH: return "SAVE VERSION MISMATCH";
+        case PSXE_MEMORY_CARD_NO_CARD: return "NO CARD";
+        case PSXE_MEMORY_CARD_UNFORMATTED: return "CARD UNFORMATTED";
+        case PSXE_MEMORY_CARD_FULL: return "CARD FULL";
         default: return "UNKNOWN CARD ERROR";
     }
 }

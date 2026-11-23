@@ -34,6 +34,9 @@
 #ifndef PSXE_MEMORY_CARD_BLOCK_SIZE
 #define PSXE_MEMORY_CARD_BLOCK_SIZE 8192
 #endif
+#if PSXE_MEMORY_CARD_BLOCK_SIZE != 8192
+#error "The PlayStation BIOS memory card block size is 8192 bytes"
+#endif
 
 #define PSXE_MAX_AUDIO_VOICES 24
 #define PSXE_MAX_SAVE_PAYLOAD (PSXE_MEMORY_CARD_BLOCK_SIZE - 544)

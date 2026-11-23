@@ -38,6 +38,7 @@ void psxe_engine_run(psxe_engine *engine, const psxe_game *game) {
     }
 
     psxe_audio_stop_all();
+    psxe_input_stop_rumble(&engine->input);
     if (game->shutdown != NULL) {
         game->shutdown(engine, game->user_data);
     }

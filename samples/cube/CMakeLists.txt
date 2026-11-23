@@ -6,5 +6,5 @@ psn00bsdk_add_cd_image(
     psxe_cube_iso
     psxe_cube
     iso.xml
-    DEPENDS psxe_cube system.cnf
+    DEPENDS psxe_cube system.cnf assets/painted.tim assets/chime.vag
 )

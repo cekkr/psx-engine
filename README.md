@@ -19,18 +19,26 @@ needed to grow complete games without hiding the console's constraints:
 - per-object/per-sprite materials: texture swaps, replace/tint colors, unlit
   and untextured shortcuts, and the four GPU blend modes, with no extra GTE
   work;
+- baked shading through the GPU's raw-texture mode and palette swaps for
+  hand-painted and indexed textures;
 - `psxe_object` mesh instances and `psxe_sprite` rectangles with atlas
   regions, scaling, flipping, and layers;
 - render-to-texture passes into offscreen VRAM, sampled as textures in the
   same frame;
 - 2D sprites, translucent panels, and debug-font UI in the same display list;
-- edge-triggered digital and analog-controller state for two ports;
-- VAG upload to SPU RAM and round-robin playback across 24 hardware voices;
-- one-block, CRC-protected, versioned memory-card saves;
+- two-port digital and analog input with button edges and DualShock rumble;
+- one-block, CRC-protected, versioned saves with both card slots, card status,
+  directory listing, free block counts, and deletion;
+- ISO9660 file lookup and byte-range reads, asynchronous 2048/2340-byte sector
+  reads, logical and physical LBA seeks, and optical drive transport control;
+- VAG loading from memory or disc into SPU RAM, 24-voice playback, and
+  single-drive XA/CD-DA playback;
+- bounded caller-owned RAM and mesh allocation, plus relocatable TIM textures
+  and CLUTs with explicit VRAM release;
 - a self-contained cube sample packaged as an emulator- and CD-ready BIN/CUE.
 
-The APIs and save format are pre-release. Streaming, asset cooking, animation,
-collision, XA/CD-DA music, richer UI, and hardware validation are intentionally
+The APIs and save format are pre-release. World streaming, asset cooking, animation,
+collision, richer UI, and hardware validation are
 tracked as future work in [`ROADMAP.md`](ROADMAP.md).
 
 ## Quick start on macOS
@@ -74,8 +82,8 @@ integration example.
 
 - D-pad left/right moves the cube laterally.
 - D-pad up/down changes its depth.
-- Cross cycles the cube's material effect (normal, tint, unlit, additive,
-  flat white).
+- Cross cycles material effects, including two baked palettes, and plays a
+  short sound with a rumble pulse on supported pads.
 - Circle swaps which of two render targets the spinning screen and the
   preview sprite show.
 - Triangle mirrors the preview sprite.
@@ -85,10 +93,11 @@ integration example.
   Render target B uses its own green light set for the pass.
 - Start writes its rotation to memory-card slot 1.
 - Select restores the saved rotation.
+- R2 shows the free block count for the first memory-card slot.
 
-The sample deliberately uses source-defined geometry so the first build has no
-asset-conversion prerequisite. Add asset cooking before treating that approach
-as a content workflow.
+The sample uses source-defined geometry and two original, repository-owned
+assets in `samples/cube/assets`. The disc contains a two-palette 4-bpp TIM
+with baked brick shading and a short mono VAG chime.
 
 ## Programming model
 
@@ -113,6 +122,12 @@ All hot-path storage is statically sized. Override `PSXE_OT_LENGTH`,
 has measured a different requirement. When the primitive arena fills, drawing
 is dropped and counted in `psxe_renderer.dropped_primitives`; memory is never
 overwritten.
+
+Use the caller-owned heap and VRAM pool for level assets and release them
+between frames. Baked materials can combine `PSXE_EFFECT_RAW_TEXTURE` and
+`PSXE_EFFECT_UNLIT` to display authored texel colors without per-mesh light
+selection or per-face GTE lighting. See the API reference for resource
+lifetimes, disc addressing, and drive ownership. [API reference](APIs.md)
 
 ## Layout
 

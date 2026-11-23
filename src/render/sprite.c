@@ -138,6 +138,7 @@ void psxe_sprite_draw(psxe_renderer *renderer, const psxe_sprite *sprite) {
     const psxe_texture *texture;
     uint32_t *bucket;
     bool semitransparent;
+    bool raw_texture;
     uint8_t blend;
     uint16_t tpage;
     unsigned int region_w;
@@ -168,6 +169,7 @@ void psxe_sprite_draw(psxe_renderer *renderer, const psxe_sprite *sprite) {
     v = (unsigned int)texture->v + sprite->v;
     tpage = psxe_tpage_with_blend(texture->tpage, blend);
     tint = material->color;
+    raw_texture = (material->effects & PSXE_EFFECT_RAW_TEXTURE) != 0;
 
     if ((region_w == (unsigned int)sprite->width) && (region_h == (unsigned int)sprite->height) &&
         !(material->effects & (PSXE_EFFECT_FLIP_X | PSXE_EFFECT_FLIP_Y))) {
@@ -179,6 +181,9 @@ void psxe_sprite_draw(psxe_renderer *renderer, const psxe_sprite *sprite) {
             return;
         }
         setSprt(rect);
+        if (raw_texture) {
+            setShadeTex(rect, 1);
+        }
         setXY0(rect, sprite->x, sprite->y);
         setWH(rect, sprite->width, sprite->height);
         setUV0(rect, (uint8_t)u, (uint8_t)v);
@@ -212,6 +217,9 @@ void psxe_sprite_draw(psxe_renderer *renderer, const psxe_sprite *sprite) {
             bottom = (uint8_t)((v > 0u) ? psxe_clamp_texel(v - 1u) : 0u);
         }
         setPolyFT4(quad);
+        if (raw_texture) {
+            setShadeTex(quad, 1);
+        }
         setXY4(quad, sprite->x, sprite->y, x1, sprite->y, sprite->x, y1, x1, y1);
         setUV4(quad, left, top, right, top, left, bottom, right, bottom);
         setRGB0(quad, tint.r, tint.g, tint.b);

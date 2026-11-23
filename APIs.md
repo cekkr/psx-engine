@@ -30,7 +30,9 @@ coupling.
 - [Render to texture — `psxe_render_target`](#render-to-texture--psxe_render_target)
 - [Scene — `scene.h`](#scene--sceneh)
 - [Input — `input.h`](#input--inputh)
+- [CD-ROM — `cd.h`](#cd-rom--cdh)
 - [Audio — `audio.h`](#audio--audioh)
+- [Asset memory — `memory.h` and `vram.h`](#asset-memory--memoryh-and-vramh)
 - [Memory card — `memory_card.h`](#memory-card--memory_cardh)
 - [Combining APIs: advanced recipes](#combining-apis-advanced-recipes)
 - [Quick index](#quick-index)
@@ -44,8 +46,8 @@ coupling.
   from the camera; objects in front of a default camera have positive `vz`.
 - **Time.** One `update` happens per video frame. `engine->ticks_per_second` is
   60 for NTSC and 50 for PAL. Convert seconds to frames with it; never assume 60.
-- **Failure is bounded.** No call allocates from the heap. When a fixed arena is
-  full, the call returns failure (`false`, `-1`, an invalid handle, an error
+- **Failure is bounded.** The frame renderer and scene use fixed-capacity storage.
+  When a fixed arena is full, the call returns failure (`false`, `-1`, an invalid handle, an error
   code) or increments `renderer.dropped_primitives`.
 - **Ownership.** Meshes, vertices, faces, textures, and samples are borrowed by
   pointer. They must outlive every frame that draws them; `static const` data is
@@ -137,7 +139,7 @@ bytes). Declare it `static`, never on the stack.
 
 Zeroes `engine`, copies the memory-card identity, picks 50/60 ticks from
 `config->render.video_mode`, sets `running = true`, then initializes renderer →
-input → audio → memory card. Call exactly once. Neither pointer may be `NULL`.
+input → audio → memory card. Initialize the optional CD service after this call. Neither pointer may be `NULL`.
 
 ### `void psxe_engine_run(psxe_engine *engine, const psxe_game *game)`
 
@@ -377,6 +379,7 @@ The resolved color is what lighting multiplies and what modulates texels
 | `PSXE_EFFECT_SEMITRANSPARENT` | Blend every primitive with `blend`. | GPU read-modify-write; untextured faces and solid sprites add one state packet each. |
 | `PSXE_EFFECT_DOUBLE_SIDED` | Skip back-face rejection for all faces. | More faces submitted. |
 | `PSXE_EFFECT_FLIP_X`, `PSXE_EFFECT_FLIP_Y` | Sprites only: mirror the texel region. | Uses a quad instead of `SPRT`. |
+| `PSXE_EFFECT_RAW_TEXTURE` | Use the sampled color directly for textured draws, including the selected CLUT. Untextured faces keep their existing color and lighting. | Skips textured-face color modulation and GTE lighting. Combine with `PSXE_EFFECT_UNLIT` on a baked mesh to skip per-mesh light selection too. |
 
 | `psxe_blend_mode` | Result (B = framebuffer, F = primitive) |
 | --- | --- |
@@ -784,6 +787,7 @@ typedef struct psxe_pad_state {
     uint8_t left_x, left_y, right_x, right_y;  /* 0..255, 128 = center */
     uint8_t type;                       /* PAD_ID_* from psxpad.h */
     bool connected;
+    bool rumble_supported;             /* motor mapping succeeded */
 } psxe_pad_state;
 ```
 
@@ -794,16 +798,23 @@ Buttons (`PadButton` from the SDK's `psxpad.h`): `PAD_SELECT`, `PAD_L3`,
 
 `connected` is true only for `PAD_ID_DIGITAL`, `PAD_ID_ANALOG_STICK`, and
 `PAD_ID_ANALOG`. Other devices (mouse, guns, multitap) read as disconnected.
-Sticks report 128 unless the pad is in an analog mode. There is no dead zone.
+Sticks report 128 unless the pad is in an analog mode. Games can apply a dead
+zone when consuming the axes. The controller keeps its selected analog or digital
+mode during motor negotiation. A lost connection emits release edges and clears
+the motor request. The engine owns SIO0 polling alongside synchronous BIOS card
+operations. Standalone callers should leave BIOS pad polling disabled.
+[Controller protocol](https://psx-spx.consoledev.net/controllersandmemorycards/)
 
 | Function | Behavior |
 | --- | --- |
-| `void psxe_input_init(psxe_input *input)` | Starts BIOS polling of both ports. Called by `psxe_engine_init`. |
-| `void psxe_input_poll(psxe_input *input)` | Converts the raw active-low data to `held` and computes `pressed`/`released` against the previous poll. Called by the engine before every `update`. |
+| `void psxe_input_init(psxe_input *input)` | Initializes snapshots and motor state. Called by `psxe_engine_init`. |
+| `void psxe_input_poll(psxe_input *input)` | Polls both SIO0 ports, converts active-low data to `held`, and computes `pressed`/`released` against the previous poll. Called by the engine before every `update`. |
 | `const psxe_pad_state *psxe_input_pad(const psxe_input *input, unsigned int port)` | Port 0 or 1, otherwise `NULL`. |
 | `bool psxe_button_held(const psxe_pad_state *pad, PadButton button)` | Button down this frame. |
 | `bool psxe_button_pressed(const psxe_pad_state *pad, PadButton button)` | Went down this frame. |
 | `bool psxe_button_released(const psxe_pad_state *pad, PadButton button)` | Went up this frame. |
+| `bool psxe_input_rumble(psxe_input *input, unsigned int port, bool small, uint8_t large, uint8_t frames)` | Requests small on/off and large intensity 0–255 for the next `frames` polls. Pass zero frames to stop on the next poll. Returns false when the port has no negotiated rumble. |
+| `void psxe_input_stop_rumble(psxe_input *input)` | Clears both requests and immediately sends zero motor levels to configured pads. Called by the engine on exit. |
 
 The button helpers return `false` for a `NULL` pad, so a missing port can be
 passed straight through.
@@ -815,6 +826,37 @@ if (psxe_button_held(pad, PAD_SQUARE)) { charge++; }
 if (psxe_button_released(pad, PAD_SQUARE)) { fire(charge); charge = 0; }
 if ((pad->held & (PAD_L1 | PAD_R1)) == (PAD_L1 | PAD_R1)) { reset_camera(); }
 ```
+
+## CD-ROM — `cd.h`
+
+Call from the main thread with interrupts enabled. The CD service owns the
+single drive and its PSn00bSDK callbacks. Audio playback and sector reads
+share the transport, so pause or stop audio before loading more data. LBAs
+start at program-area MSF 00:02:00 and have 75 sectors per second.
+
+| Function | Behavior |
+| --- | --- |
+| `psxe_cd_init()` | Initializes the drive after renderer/IRQ setup. Call before other CD operations. |
+| `psxe_cd_status(&status)` | Reports lid, spindle, seek, data/XA read, and CD-DA play state. May be queried during audio playback. |
+| `psxe_cd_seek(lba, audio_track)` | Waits for a logical data-header seek or a physical subchannel seek when `audio_track` is true. |
+| `psxe_cd_position(&lba)` | Reports the current physical head position from subchannel Q. Data reads use the exact requested LBA. |
+| `psxe_cd_motor_on()`, `psxe_cd_pause()`, `psxe_cd_stop()` | Spin up, pause with the spindle running, or stop transport and spindle. Pending sector reads must be cancelled or completed first. |
+| `psxe_cd_read_start(lba, sectors, mode, destination, capacity)` | Starts an IRQ-driven read into word-aligned RAM. `PSXE_CD_DATA` transfers `PSXE_CD_SECTOR_SIZE` (2048) bytes per sector. `PSXE_CD_RAW` transfers `PSXE_CD_RAW_SECTOR_SIZE` (2340) bytes per sector, including the sector header and excluding sync bytes. |
+| `psxe_cd_read_poll()`, `psxe_cd_read_wait()` | Check progress once or wait until complete. Success and errors finalize the transport before returning. The final poll may wait for the drive to pause. |
+| `psxe_cd_read_cancel()` | Disarms DMA to the caller's buffer and stops reading. May stop the spindle if pause is rejected during a seek. |
+| `psxe_cd_find(path, &file)` | Finds a contiguous file on a primary ISO9660 volume. Use slash or backslash, case-insensitive path components, and an optional `;1` suffix. Returns the starting LBA and byte length in `psxe_cd_file`. |
+| `psxe_cd_read_file(&file, offset, destination, size)` | Blocking exact byte-range read into caller-owned RAM. Partial sectors and unaligned destinations use a shared sector buffer. Re-resolve file extents after a disc change. |
+| `psxe_cd_play_xa(lba, file, channel, double_speed)` | Starts decoding the selected XA file/channel. The caller controls the playback range and calls pause/stop. |
+| `psxe_cd_xa_filter(file, channel)` | Changes the selected XA file/channel during playback. Channel range is 0–31. |
+| `psxe_cd_play_cdda(lba)` | Starts CD-DA on an audio track and enables track-end auto-pause. Query status or pause/stop before the next transfer. |
+| `psxe_cd_set_audio_volume(left, right)`, `psxe_cd_set_muted(muted)` | Set the SPU CD input levels (0–`0x7fff`) or mute/demute drive audio. |
+
+Sector reads own access to their destination until poll, wait, or cancel
+returns a terminal result. The start call returns `PSXE_CD_PENDING` when the
+transfer begins. Treat the buffer as incomplete on error or cancellation.
+After a transport failure, `psxe_cd_stop` can recover the drive before reuse.
+The laser follows the drive's built-in seek and transport commands.
+[CD-ROM command reference](https://github.com/psx-spx/psx-spx.github.io/blob/master/docs/cdromdrive.md)
 
 ## Audio — `audio.h`
 
@@ -831,13 +873,14 @@ typedef struct psxe_audio_sample {
 | --- | --- |
 | `void psxe_audio_init(psxe_audio *audio)` | Initializes the SPU, sets master volume, resets the SPU RAM allocator to `0x1010`. Called by `psxe_engine_init`. |
 | `bool psxe_audio_upload_vag(psxe_audio *audio, psxe_audio_sample *sample, const void *vag_data, size_t vag_size)` | Validates a mono VAG (`VAGp` magic, big-endian size), DMA-uploads the payload without the 48-byte header to the next 64-byte-aligned SPU address, and fills `sample`. `false` on bad data or when SPU RAM (512 KiB) is full. Space is never reclaimed. |
+| `psxe_cd_result psxe_audio_load_vag(psxe_audio *audio, psxe_audio_sample *sample, const psxe_cd_file *file, void *scratch, size_t capacity)` | Reads the VAG into caller-owned scratch of at least `file->size` bytes, then validates it and uploads to SPU RAM. The scratch can be released after the call. |
 | `int psxe_audio_play(psxe_audio *audio, const psxe_audio_sample *sample, uint16_t volume, int16_t pan)` | Plays on the next voice (round robin over 24) and returns it, or `-1`. `volume` 0..`0x3fff`; `pan` `-0x1000` (left) .. `0` (center) .. `0x1000` (right); both are clamped. A busy voice is cut off. |
 | `void psxe_audio_stop(int voice)` | Keys off one voice; ignores out-of-range values (including `-1`). |
 | `void psxe_audio_stop_all(void)` | Keys off all 24 voices. Called by the engine after the loop exits. |
 
 Uploads block on DMA; do them in `init` or during loading. Looping depends only
 on the loop flags encoded in the VAG blocks. There is no "is playing" query.
-No VAG sample is bundled yet, so audio is compile-tested only.
+The cube disc includes `/ASSETS/CHIME.VAG` as a resident audio example.
 
 ```c
 extern const uint8_t jump_vag[];
@@ -861,9 +904,11 @@ typedef struct psxe_memory_card_config {
 
 Results: `PSXE_MEMORY_CARD_OK`, `PSXE_MEMORY_CARD_INVALID_ARGUMENT`,
 `PSXE_MEMORY_CARD_NOT_FOUND`, `PSXE_MEMORY_CARD_IO_ERROR`,
-`PSXE_MEMORY_CARD_CORRUPT`, `PSXE_MEMORY_CARD_VERSION_MISMATCH`.
+`PSXE_MEMORY_CARD_CORRUPT`, `PSXE_MEMORY_CARD_VERSION_MISMATCH`,
+`PSXE_MEMORY_CARD_NO_CARD`, `PSXE_MEMORY_CARD_UNFORMATTED`,
+and `PSXE_MEMORY_CARD_FULL`.
 
-The file name is `bu00:` (slot 0 = physical slot 1) or `bu01:` (slot 1)
+The file name is `bu00:` (slot 0 = physical slot 1) or `bu10:` (slot 1)
 followed by `product_code` and `identifier`. Each identity is one 8192-byte
 file with a BIOS header, a static icon, and an engine header (magic, version,
 size, CRC32) at byte 512.
@@ -873,6 +918,9 @@ size, CRC32) at byte 512.
 | `void psxe_memory_card_init(void)` | Starts BIOS card services. Called by `psxe_engine_init`. |
 | `psxe_memory_card_result psxe_memory_card_save(const psxe_memory_card_config *config, unsigned int slot, const void *payload, size_t payload_size)` | Writes the whole block, replacing an existing save. `payload_size` must be 1..`PSXE_MAX_SAVE_PAYLOAD`. |
 | `psxe_memory_card_result psxe_memory_card_load(const psxe_memory_card_config *config, unsigned int slot, void *payload, size_t payload_capacity, size_t *payload_size)` | Reads and validates magic, header version, size, `format_version`, and CRC **before** copying into `payload`. `INVALID_ARGUMENT` if the stored payload is larger than `payload_capacity`. `payload_size` may be `NULL`. |
+| `psxe_memory_card_result psxe_memory_card_status(unsigned int slot)` | Reads the card header to report presence and format. |
+| `psxe_memory_card_result psxe_memory_card_list(unsigned int slot, psxe_memory_card_file *files, size_t capacity, size_t *count, unsigned int *free_blocks)` | Copies up to `capacity` entries with a zero-terminated name and size in bytes. Optional outputs receive the total entries and free 8192-byte blocks. Pass `NULL, 0` to query without copying. A card has at most `PSXE_MEMORY_CARD_MAX_FILES` (15) entries. |
+| `psxe_memory_card_result psxe_memory_card_delete(const psxe_memory_card_config *config, unsigned int slot)` | Deletes the save with the given identity. |
 | `const char *psxe_memory_card_result_string(psxe_memory_card_result result)` | Uppercase message suitable for `psxe_ui_text`. |
 
 Card calls block for a noticeable time. Call them only on a user action or a
@@ -885,6 +933,44 @@ typedef struct save_v1 { int32_t level; int32_t score; } save_v1;
 save_v1 s = { 3, 12000 };
 psxe_memory_card_result r = psxe_memory_card_save(&engine->memory_card, 0, &s, sizeof(s));
 psxe_ui_text(&engine->renderer, 10, 220, psxe_memory_card_result_string(r));
+```
+
+## Asset memory — `memory.h` and `vram.h`
+
+Use one caller-owned heap per asset lifetime and one managed VRAM pool per
+renderer. These operations are intended for initialization and level changes.
+
+| Function | Behavior |
+| --- | --- |
+| `psxe_heap_init(&heap, memory, size)` | Initializes heap metadata inside caller-owned RAM. Reinitializing the heap invalidates its allocations. |
+| `psxe_heap_alloc(&heap, size)` | Returns an 8-byte-aligned block or `NULL`. Uses first-fit allocation. |
+| `psxe_heap_free(&heap, memory)` | Releases a live allocation from this heap and coalesces adjacent free blocks. Returns false for an invalid allocation. |
+| `psxe_heap_get_stats(&heap)` | Returns used, free, and largest contiguous free payload bytes. Header overhead is excluded. |
+| `psxe_mesh_alloc(&heap, vertices, normals, faces)` | Allocates a `psxe_mesh_storage` with writable arrays and the read-only mesh view used by scene entities or objects. Fill all referenced vertices, faces, and normals before drawing. A mesh can have zero normals. |
+| `psxe_mesh_free(&heap, storage)` | Releases the mesh and its arrays together after all instances detach it. |
+| `psxe_vram_init(&vram, &renderer)` | Reserves both framebuffers and the debug font. |
+| `psxe_vram_reserve(&vram, x, y, width, height)` | Reserves a fixed rectangle, rounded out to 16-halfword × 8-row tiles. Call before loading assets for fixed targets or manually placed textures. Coordinates use VRAM halfwords. |
+| `psxe_vram_load_tim(&vram, bytes, size, &id)` | Validates a sized, word-aligned 4/8/16-bit TIM, relocates it inside one texture page and uploads its pixels and optional CLUT. The TIM's source coordinates are ignored. A CLUT block may contain multiple rows of 16 or 256 colors. |
+| `psxe_vram_get(&vram, id)` | Returns a borrowed texture view or `NULL` for a stale ID. |
+| `psxe_vram_palette(&vram, id, row, &view)` | Copies a texture view using a zero-based CLUT row. Keeps the same uploaded texels. |
+| `psxe_vram_free(&vram, id)` | Synchronizes with submitted GPU work, invalidates the ID and recycles the texture and CLUT tiles. |
+
+Perform managed TIM uploads and frees outside frame builds, after detaching
+every mesh, material, and sprite that borrows the texture or a palette view.
+Source TIM bytes can be released after upload. A pool holds up to
+`PSXE_VRAM_MAX_TEXTURES` textures, subject to available page-compatible space.
+IDs belong to the lifetime of their pool. Discard them when reinitializing it.
+Set the raw-texture and unlit flags on a mesh whose texture contains baked
+shadows and highlights.
+
+```c
+psxe_texture evening;
+if (psxe_vram_palette(&vram, wall_texture, 1, &evening)) {
+    /* Keep evening alive for as long as the material borrows it. */
+    psxe_material_set_texture(&wall_material, &evening);
+    psxe_material_set_effects(&wall_material,
+        PSXE_EFFECT_RAW_TEXTURE | PSXE_EFFECT_UNLIT, PSXE_BLEND_HALF);
+}
 ```
 
 ## Combining APIs: advanced recipes
@@ -1186,7 +1272,7 @@ static psxe_memory_card_result load_any(const psxe_engine *engine, save_v2 *out)
 ```
 
 Write the migrated data back with `psxe_memory_card_save` on the next explicit
-save, not automatically every frame. Use slot 1 (`bu01:`) the same way for a
+save, not automatically every frame. Use slot 1 (`bu10:`) the same way for a
 second card, for example "copy save to other card":
 
 ```c
@@ -1363,12 +1449,14 @@ STP note above).
 | `render.h` (sprites) | `psxe_sprite_init`, `psxe_sprite_set_texture`, `psxe_sprite_set_region`, `psxe_sprite_set_position`, `psxe_sprite_move`, `psxe_sprite_set_size`, `psxe_sprite_set_color`, `psxe_sprite_set_effects`, `psxe_sprite_set_layer`, `psxe_sprite_draw` |
 | `render.h` (render to texture) | `psxe_render_target_init`, `psxe_render_target_begin`, `psxe_render_target_end`, `psxe_render_target_texture` |
 | `scene.h` | `psxe_scene_init`, `psxe_scene_create`, `psxe_scene_destroy`, `psxe_scene_get`, `psxe_scene_get_const`, `psxe_scene_render`, `psxe_scene_set_light`, `psxe_scene_clear_light`, `psxe_scene_light`, `psxe_scene_light_world`, `psxe_scene_gather_lights` |
-| `input.h` | `psxe_input_init`, `psxe_input_poll`, `psxe_input_pad`, `psxe_button_held`, `psxe_button_pressed`, `psxe_button_released` |
-| `audio.h` | `psxe_audio_init`, `psxe_audio_upload_vag`, `psxe_audio_play`, `psxe_audio_stop`, `psxe_audio_stop_all` |
-| `memory_card.h` | `psxe_memory_card_init`, `psxe_memory_card_save`, `psxe_memory_card_load`, `psxe_memory_card_result_string` |
+| `input.h` | `psxe_input_init`, `psxe_input_poll`, `psxe_input_rumble`, `psxe_input_stop_rumble`, `psxe_input_pad`, `psxe_button_held`, `psxe_button_pressed`, `psxe_button_released` |
+| `cd.h` | `psxe_cd_init`, `psxe_cd_status`, `psxe_cd_seek`, `psxe_cd_position`, `psxe_cd_motor_on`, `psxe_cd_pause`, `psxe_cd_stop`, `psxe_cd_read_start`, `psxe_cd_read_poll`, `psxe_cd_read_wait`, `psxe_cd_read_cancel`, `psxe_cd_find`, `psxe_cd_read_file`, `psxe_cd_play_xa`, `psxe_cd_xa_filter`, `psxe_cd_play_cdda`, `psxe_cd_set_audio_volume`, `psxe_cd_set_muted` |
+| `memory.h` | `psxe_heap_init`, `psxe_heap_alloc`, `psxe_heap_free`, `psxe_heap_get_stats`, `psxe_mesh_alloc`, `psxe_mesh_free` |
+| `vram.h` | `psxe_vram_init`, `psxe_vram_reserve`, `psxe_vram_load_tim`, `psxe_vram_get`, `psxe_vram_palette`, `psxe_vram_free` |
+| `audio.h` | `psxe_audio_init`, `psxe_audio_upload_vag`, `psxe_audio_load_vag`, `psxe_audio_play`, `psxe_audio_stop`, `psxe_audio_stop_all` |
+| `memory_card.h` | `psxe_memory_card_init`, `psxe_memory_card_save`, `psxe_memory_card_load`, `psxe_memory_card_status`, `psxe_memory_card_list`, `psxe_memory_card_delete`, `psxe_memory_card_result_string` |
 
 Not available yet (see [`ROADMAP.md`](ROADMAP.md)): near-plane clipping,
 Gouraud shading and per-vertex lighting, light-radius debug draw, fog, sprite rotation, double-buffered or paletted render
-targets, a VRAM allocator, animation, collision, VRAM/SPU allocators with reclaim,
-voice status, streaming audio, asynchronous or listable card operations,
-rumble, and multitap.
+targets, animation, collision, SPU reclamation and voice completion tracking,
+asynchronous card operations, and multitap.

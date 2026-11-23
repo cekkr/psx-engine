@@ -72,7 +72,7 @@ runtime code around convenient desktop parsers.
 ### Current and planned behavior stay separate
 
 Only compiled and proportionally tested behavior is present or experimental.
-Streaming, animation, collision, fog, asset cooking, asynchronous saves, and
+World streaming, animation, collision, fog, asset cooking, asynchronous saves, and
 platform bootstrap beyond macOS remain planned until their code and validation
 land.
 
@@ -137,10 +137,19 @@ silently simulate faster/slower without an explicit game policy.
 - **Scene light slots:** `psxe_entity.light_slot` and
   `psxe_scene_light_slot.owner` must point at each other; `psxe_scene_destroy`
   clears the slot before bumping generation, and gather re-checks both links.
-- **Active-low pads:** BIOS pad bits are zero when pressed.
-  [`src/platform/input.c`](src/platform/input.c) inverts them once, then derives
-  `pressed` and `released`. Game code must use `psxe_pad_state`, not reinterpret
-  the raw buffer.
+- **SIO0 ownership:** [`src/platform/input.c`](src/platform/input.c) polls
+  each controller in a bounded critical section. The BIOS card driver starts
+  with BIOS pad polling disabled. Active-low pad bits are inverted once before
+  deriving button edges. Motor negotiation preserves the selected pad mode.
+- **CD ownership:** [`src/platform/cd.c`](src/platform/cd.c) owns the SDK CD
+  callbacks. Never call a parallel SDK CD reader. A data read borrows DMA
+  memory until its terminal result. Disarm the callback before recovering from
+  cancellation or failure. Sector-transfer mode controls the DMA stride.
+- **Asset ownership:** [`src/core/memory.c`](src/core/memory.c) owns mesh and
+  heap lifetimes. [`src/render/vram.c`](src/render/vram.c) owns managed TIM
+  pixels and palettes. Reserve fixed targets and legacy TIM regions before
+  managed uploads. Detach borrowed views before release and wait for GPU work
+  before recycling VRAM. Managed transfers happen between frame builds.
 - **SPU DMA and memory:** uploads begin after `0x1010`, are rounded/aligned to 64
   bytes, and must remain below `0x80000`. `psxe_audio_upload_vag` must validate
   big-endian header lengths before DMA. Playback may steal the next round-robin
@@ -176,7 +185,7 @@ arena + ordering table → `psxe_renderer_end_frame` → GPU DMA/vblank
 Persistence flow:
 
 game payload → one-block BIOS save header + PSXE format header + CRC → `bu00:` or
-`bu01:`; load validates all metadata before copying back to the caller.
+`bu10:`; load validates all metadata before copying back to the caller.
 
 Runtime is a single process on one MIPS CPU. The GTE and GPU execute submitted
 work asynchronously, SPU voices play independently after key-on, and memory-card
@@ -236,25 +245,25 @@ rotation is a 4096-unit full turn and scale is 20.12 fixed point (`ONE`).
 ### [`src/include/psxe/input.h`](src/include/psxe/input.h)
 
 Declares `psxe_input`, normalized `psxe_pad_state`, polling, port lookup, and
-held/pressed/released queries. Raw 34-byte BIOS buffers remain an implementation
-boundary even though they are stored in the context.
+held/pressed/released queries and finite-duration rumble. The raw SIO0 reply
+is private to the driver.
 
 ### [`src/platform/input.c`](src/platform/input.c)
 
-Initializes BIOS pad polling and translates two ports each frame.
+Polls both SIO0 ports each frame and negotiates DualShock motor mapping.
 
-- **Key functions:** `psxe_input_init` owns `InitPAD`/`StartPAD` ordering;
-  `psxe_input_poll` normalizes active-low bits, type support, axes, and edges;
-  query helpers reject null/invalid ports.
-- **Tests:** target compile and cube sample input; emulator/hardware reconnect
-  tests are a known gap.
+- **Key functions:** `psxe_input_poll` owns bounded serial exchange, active-low
+  normalization, reconnect/idle handling, and edges. `psxe_input_rumble` queues
+  motor levels for a finite number of polls.
+- **Tests:** DuckStation digital pad input and DualShock motor mapping/output.
+  Physical controllers, prolonged disconnects, and PAL timing remain open.
 - **Common mistake:** computing edges from raw active-low bits reverses presses.
 
 ### [`src/include/psxe/audio.h`](src/include/psxe/audio.h)
 
 Declares the linear SPU allocator, validated resident sample descriptor,
-round-robin play, and stop API. It does not promise streaming, priorities,
-automatic loop conversion, or voice completion callbacks.
+round-robin play, stop, and VAG loading from an ISO file with caller-owned
+staging RAM. The CD module owns XA and CD-DA playback.
 
 ### [`src/platform/audio.c`](src/platform/audio.c)
 
@@ -264,14 +273,16 @@ setup, and key on/off.
 - **Key functions:** `psxe_audio_upload_vag` validates `VAGp`, big-endian size
   and sample rate, and SPU capacity; `psxe_audio_play` clamps volume/pan and may
   steal the next voice.
-- **Tests:** target compile only; audible emulator/hardware tests remain open.
+- **Tests:** the cube chime loads and starts a voice in DuckStation. Audible
+  capture and hardware tests remain open.
 - **Common mistake:** VAG fields are big-endian and the first 4 KiB of SPU RAM
   is reserved. Do not upload the 48-byte VAG header as sample data.
 
 ### [`src/include/psxe/memory_card.h`](src/include/psxe/memory_card.h)
 
 Declares game identity/title/version configuration, result codes, and synchronous
-save/load calls. Slot zero means physical port/card slot 1 (`bu00:`).
+save/load, status, directory/free-block, and delete calls. Slots zero and one
+mean physical port/card slots 1 and 2 (`bu00:` and `bu10:`).
 
 ### [`src/platform/memory_card.c`](src/platform/memory_card.c)
 
@@ -281,11 +292,29 @@ CRC32, and exact-block file I/O.
 - **Key subparts:** `psxe_make_filename` enforces the 20-character card filename
   payload; `psxe_write_card_visual_header` creates one static icon;
   `psxe_memory_card_load` validates before copy.
-- **Tests:** cube sample save/load path; card-full, removal, unformatted, real
-  hardware, and BIOS-manager appearance remain gaps.
+- **Tests:** DuckStation save, overwrite, load, listing, and deletion in both
+  slots. Card-full, removal, unformatted, and hardware cases remain open.
 - **Common mistake:** changing payload layout without incrementing
   `format_version` makes old data appear valid. Do not return a partially read
   payload.
+
+### [`src/include/psxe/cd.h`](src/include/psxe/cd.h) and [`src/platform/cd.c`](src/platform/cd.c)
+
+Owns ISO9660 file lookup, byte ranges, sector DMA, LBA seeks, spindle and
+transport control, XA filtering, and CD-DA. The drive serves one operation
+at a time. The byte-range reader uses a shared 2048-byte scratch sector for
+partial or unaligned reads. Audio and data share the drive.
+
+### [`src/include/psxe/memory.h`](src/include/psxe/memory.h) and [`src/core/memory.c`](src/core/memory.c)
+
+Owns the caller-backed aligned heap, adjacent-block coalescing and statistics,
+and the single-allocation `psxe_mesh_storage` view and writable arrays.
+
+### [`src/include/psxe/vram.h`](src/include/psxe/vram.h) and [`src/render/vram.c`](src/render/vram.c)
+
+Owns reservations, page-aware placement, sized TIM/CLUT validation, palette
+views, and generation-checked release. Tiles are 16 VRAM halfwords by 8 rows.
+Legacy fixed uploads and render targets require explicit reservations.
 
 ### [`src/include/psxe/render.h`](src/include/psxe/render.h)
 
@@ -373,7 +402,7 @@ public SDK macros, and the 16-bit texture view.
   capture, multiple-pass ordering, STP/black-texel behavior, and hardware runs
   are gaps.
 - **Common mistake:** sampling a target in its own pass, black (`0x0000`) texels
-  becoming transparent, or overlapping a TIM (no VRAM allocator exists).
+  becoming transparent, or failing to reserve its rectangle in a managed pool.
 
 ### [`src/include/psxe/scene.h`](src/include/psxe/scene.h)
 
@@ -544,29 +573,28 @@ tools, sample inputs from elsewhere, or future third-party assets.
 
 - **Behavior:** bounded offscreen passes into validated 16-bit VRAM rectangles,
   executed before the main pass in begin order and sampled as `psxe_texture`.
-- **Gap:** single-buffered only, no paletted/8-bit targets, no VRAM allocator,
+- **Gap:** single-buffered only, no paletted/8-bit or automatically allocated targets,
   no emulator/hardware validation.
 
 ### Controllers — Experimental/scaffold
 
-- **Behavior:** two ports, common digital/analog IDs, axes, held/edge masks.
-- **Gap:** no mode negotiation, rumble, multitap, dead zones, reconnect policy,
-  or hardware matrix.
+- **Behavior:** two ports, common digital/analog IDs, axes, held/edge masks,
+  motor mapping, finite rumble, and reconnect handling.
+- **Gap:** no forced analog-mode switching, multitap, dead zones, or hardware matrix.
 
 ### Resident VAG effects — Experimental/scaffold
 
-- **Behavior:** validated mono VAG payloads upload linearly and play with
-  volume/pan on round-robin hardware voices.
-- **Gap:** no cooker, reclaim, priorities, status, buses, spatialization,
-  streaming, XA, CD-DA, or loop policy beyond encoded VAG block flags.
+- **Behavior:** validated mono VAG payloads from RAM or disc upload linearly
+  and play with volume/pan on round-robin hardware voices.
+- **Gap:** no cooker, reclaim, priorities, status, buses, or spatialization.
+  XA and CD-DA use the separate CD transport.
 
 ### Memory-card saves — Experimental/scaffold
 
-- **Behavior:** one synchronous, one-block file per identity with format version
-  and CRC; sample saves cube rotation.
-- **Gap:** no asynchronous state machine, card status/free space/list/delete,
-  localization/icon asset, journaling, migration callbacks, or physical-card
-  validation.
+- **Behavior:** synchronous one-block files per identity with version and CRC,
+  plus directory, block count, status, and delete. The sample saves cube rotation.
+- **Gap:** no asynchronous state machine, localization/icon assets, journaling,
+  migration callbacks, or physical-card validation.
 
 ### Packet allocation overflow
 
@@ -596,7 +624,7 @@ tools, sample inputs from elsewhere, or future third-party assets.
   target shows stale/garbage pixels.
 - **Cause and invariant:** sampled 16-bit texel `0x0000` is transparent; the pass
   silently drops when the packet arena cannot hold `ot_length * 4 + 72` bytes;
-  VRAM is not allocated, so a TIM can overwrite the rectangle.
+  an unreserved rectangle can be overwritten by a TIM.
 - **Safe pattern / check:** non-black clear color, check `begin`'s return and
   `target_passes`, author TIM positions away from targets, inspect VRAM in
   PCSX-Redux.
@@ -630,6 +658,12 @@ tools, sample inputs from elsewhere, or future third-party assets.
   [`src/core/scene.c`](src/core/scene.c).
 - Controller snapshots: `psxe_input_*`, `psxe_button_*` →
   [`src/platform/input.c`](src/platform/input.c).
+- CD data, drive, and audio transport: `psxe_cd_*` →
+  [`src/platform/cd.c`](src/platform/cd.c).
+- Asset RAM and mesh storage: `psxe_heap_*`, `psxe_mesh_alloc/free` →
+  [`src/core/memory.c`](src/core/memory.c).
+- Managed texture storage: `psxe_vram_*` →
+  [`src/render/vram.c`](src/render/vram.c).
 - Resident sound: `psxe_audio_*` → [`src/platform/audio.c`](src/platform/audio.c).
 - Save persistence: `psxe_memory_card_*` →
   [`src/platform/memory_card.c`](src/platform/memory_card.c).
@@ -674,10 +708,13 @@ data handling are planned, not shipped.
   command, then emulator boot (manual).
 - 3D/light objects/scene lights/UI, materials/effects, objects, sprites, render targets, and
   input/save integration → [`samples/cube/main.c`](samples/cube/main.c)
-  (manual runtime; not yet emulator-verified for the render-target path).
+  (manual runtime and DuckStation smoke checks).
 - Script syntax → `bash -n build.sh run.sh thirds/setup_macos.sh`.
 - Dependency installation → `./thirds/setup_macos.sh --check`.
-- Audio playback → no bundled VAG sample; compile only, explicit known test gap.
+- Disc data/audio, mesh and texture lifetime → DuckStation checks with the
+  cube disc plus temporary smoke executables. A separate mixed-mode disc
+  checks XA filter/mute/pause and CD-DA track-end auto-pause. Original hardware
+  tests remain open.
 - Memory-card corruption/capacity/removal → no focused tests; explicit known
   gap and near-term roadmap item.
 
@@ -710,24 +747,24 @@ data handling are planned, not shipped.
 
 - macOS-local reproducible target toolchain/SDK bootstrap.
 - Engine static library, callback loop, scene pool, 3D/2D renderer, light
-  objects and scene lights, materials and effects, object/sprite structs, render-to-texture passes, controller
-  snapshots, resident VAG/SPU path, one-block saves, cube EXE and BIN/CUE.
+  objects and scene lights, materials with baked textures, render-to-texture,
+  controller input and rumble, ISO/sector/drive access, CD and resident VAG
+  audio, one-block saves, bounded RAM/VRAM allocation, and cube EXE and BIN/CUE.
 
 ### Known Gaps
 
 - No automated tests, CI, emulator smoke harness, profiling, or original-hardware
   validation.
 - Renderer lacks clipping, subdivision, production culling, animation, fog,
-  Gouraud shading, asset cooking, and resource allocators.
-- Audio and save APIs cover minimal synchronous resident cases only.
+  Gouraud shading, and asset cooking.
+- SPU reclamation, mixed audio/data scheduling, and asynchronous card I/O are open.
 - Linux/Windows bootstraps and safe physical-media workflow are not implemented.
 
 ### Near-Term Priorities
 
 1. Complete Milestone 0 runtime validation and Milestone 1 diagnostics/tests in
    [`ROADMAP.md`](ROADMAP.md).
-2. Build the versioned asset cooker and memory allocators before expanding game
-   content APIs.
+2. Build the versioned asset cooker and expand resource lifetime diagnostics.
 3. Add production clipping/culling/render budgets and streaming world services.
 
 ## Task Start and Handoff Checklist
