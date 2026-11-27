@@ -587,6 +587,8 @@ User-facing mission, current feature boundary, macOS workflow, programming
 model, sample controls, influences, and safety/status notes. It must not claim a
 ROADMAP feature is implemented.
 
+Store README images and recordings in [`md-assets/`](md-assets/).
+
 ### [`APIs.md`](APIs.md)
 
 Game-developer reference for every public header symbol, with per-function

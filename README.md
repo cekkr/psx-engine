@@ -132,6 +132,8 @@ limit of about 15.48 ms. The release sample uses the compact frame and light HUD
 
 ## Carrot Man sample
 
+![Carrot Man idles, then walks and turns around the demo floor in DuckStation.](md-assets/carrot-man-demo.gif)
+
 Open the Carrot Man CUE in an emulator and use the port 1 D-pad or left analog
 stick. The character faces the direction of travel, loops its walk while
 moving, and idles when you release the controller. The build uses the supplied
