@@ -1,20 +1,14 @@
 # psx-engine API Reference
 
-This file lists every public function, type, and macro in
-[`src/include/psxe/`](src/include/psxe/), with short snippets and longer
-examples that combine several subsystems. It describes the checked-out
-revision only. Everything here is **experimental/scaffold** (see
-[`AGENTS.md`](AGENTS.md) and [`ROADMAP.md`](ROADMAP.md)): the API is
-pre-release, may change, and has not been validated on original hardware.
+This reference covers the public C99 declarations, calling rules, and examples
+for the checked-out revision. The engine targets the original PlayStation
+through PSn00bSDK. The API and save format are experimental. [Public headers](src/include/psxe/) · [Implementation map](AGENTS.md#interface-ownership-map) · [Roadmap](ROADMAP.md)
 
-Include everything with the umbrella header:
+Use the umbrella header or the individual header named in each section.
 
 ```c
 #include <psxe/psxe.h>
 ```
-
-or include the narrower headers (`psxe/render.h`, `psxe/scene.h`, ...) to reduce
-coupling.
 
 ## Contents
 
@@ -31,29 +25,37 @@ coupling.
 - [Scene — `scene.h`](#scene--sceneh)
 - [Input — `input.h`](#input--inputh)
 - [CD-ROM — `cd.h`](#cd-rom--cdh)
+  - [Drive and transport](#drive-and-transport)
+  - [Sector reads and file lookup](#sector-reads-and-file-lookup)
+  - [XA and CD-DA](#xa-and-cd-da)
 - [Audio — `audio.h`](#audio--audioh)
-- [Asset memory — `memory.h` and `vram.h`](#asset-memory--memoryh-and-vramh)
 - [Memory card — `memory_card.h`](#memory-card--memory_cardh)
+- [Asset memory — `memory.h` and `vram.h`](#asset-memory--memoryh-and-vramh)
+  - [Main RAM and mesh storage](#main-ram-and-mesh-storage)
+  - [Managed texture storage](#managed-texture-storage)
 - [Combining APIs: advanced recipes](#combining-apis-advanced-recipes)
 - [Quick index](#quick-index)
 
 ## Conventions
 
-- **Units.** `VECTOR`/`SVECTOR` positions are integer world units. Rotation uses
-  4096 units per full turn (`PSXE_ANGLE_FULL_TURN`). Scale and unit normals use
-  20.12 fixed point where `ONE` (4096) is 1.0.
+- **Units.** Positions and mesh vertices use integer world units. Rotation uses
+  4096 units per full turn (`PSXE_ANGLE_FULL_TURN`). Scale, normals, and light
+  directions use 4096 as 1.0 (`PSXE_FIXED_ONE`).
 - **Axes.** The GTE projects with Y pointing down the screen and +Z going away
   from the camera; objects in front of a default camera have positive `vz`.
-- **Time.** One `update` happens per video frame. `engine->ticks_per_second` is
-  60 for NTSC and 50 for PAL. Convert seconds to frames with it; never assume 60.
+- **Time.** One `update` runs per video frame. `engine->ticks_per_second` is
+  60 for NTSC and 50 for PAL. Use it to convert durations to frame counts.
 - **Failure is bounded.** The frame renderer and scene use fixed-capacity storage.
   When a fixed arena is full, the call returns failure (`false`, `-1`, an invalid handle, an error
   code) or increments `renderer.dropped_primitives`.
-- **Ownership.** Meshes, vertices, faces, textures, and samples are borrowed by
-  pointer. They must outlive every frame that draws them; `static const` data is
-  the normal choice.
-- **NULL.** Most functions ignore `NULL` arguments (noted per function). The
-  `*_init` functions (except `psxe_light_init`) do not check.
+- **Ownership.** Objects, entities, and materials borrow their mesh or texture
+  pointers. Detach those borrowers before releasing managed assets. GPU packets
+  hold copied draw data and reference VRAM, so managed VRAM release waits for
+  pending GPU work. The disc service borrows a sector buffer from read start
+  through completion or cancellation.
+- **Pointers.** Pass initialized contexts and valid output buffers unless the
+  function documents an optional pointer. The renderer, engine, scene, input,
+  and audio initializers require writable context storage.
 
 ## Configuration macros — `config.h`
 
@@ -64,7 +66,7 @@ coupling.
 | `PSXE_MAX_ENTITIES` | `128` | Slots in a `psxe_scene`. |
 | `PSXE_MAX_LIGHTS` | `8` | Lights in the renderer's light set (1..255). |
 | `PSXE_MAX_SCENE_LIGHTS` | `8` | Entity-owned lights in a `psxe_scene` (1..254). |
-| `PSXE_MEMORY_CARD_BLOCK_SIZE` | `8192` | Bytes per save file (one card block). |
+| `PSXE_MEMORY_CARD_BLOCK_SIZE` | `8192` | Bytes per save file. The header rejects any other value. |
 | `PSXE_MAX_AUDIO_VOICES` | `24` | Hardware SPU voices (fixed, not overridable). |
 | `PSXE_MAX_SAVE_PAYLOAD` | `8192 - 544` = 7648 | Largest payload accepted by `psxe_memory_card_save`. |
 
@@ -138,9 +140,11 @@ bytes). Declare it `static`, never on the stack.
 
 ### `void psxe_engine_init(psxe_engine *engine, const psxe_engine_config *config)`
 
-Zeroes `engine`, copies the memory-card identity, picks 50/60 ticks from
-`config->render.video_mode`, sets `running = true`, then initializes renderer →
-input → audio → memory card. Initialize the optional CD service after this call. Neither pointer may be `NULL`.
+Zeroes `engine`, copies the memory-card configuration, selects the regional tick
+rate, and sets `running = true`. Initializes the renderer, input, audio, and
+memory card in that order. Use static storage for the engine and keep the
+memory-card strings alive for later save calls. Initialize the optional CD
+service after this call. Both pointers are required.
 
 ### `void psxe_engine_run(psxe_engine *engine, const psxe_game *game)`
 
@@ -150,26 +154,54 @@ Calls `init` once, then loops while `engine->running`:
 2. `psxe_renderer_begin_frame` → `render` → `psxe_renderer_end_frame`
 3. `++engine->frame`
 
-After the loop it calls `psxe_audio_stop_all` and then `shutdown`. Every
-callback may be `NULL`. Returns immediately if either argument is `NULL`.
+On exit it stops the SPU voices and controller rumble before calling `shutdown`.
+Each callback is optional. The function returns immediately if either argument
+is `NULL`.
 
 ### `void psxe_engine_stop(psxe_engine *engine)`
 
-Sets `running = false`. The current frame finishes rendering, then the loop
-exits. Console games normally never call it; it is useful for tests and demo
-attract loops.
+Sets `running = false`. A call from `update` or `render` lets that frame finish
+before shutdown. A call from `init` skips the frame loop. Ignores a `NULL` engine.
+
+This complete program changes the background while Cross is held and exits the
+engine loop when Start is pressed.
 
 ```c
+#include <psxe/psxe.h>
+
+typedef struct demo_state {
+    bool cross_held;
+} demo_state;
+
+static void demo_update(psxe_engine *engine, void *user_data) {
+    demo_state *state = user_data;
+    const psxe_pad_state *pad = psxe_input_pad(&engine->input, 0);
+    state->cross_held = psxe_button_held(pad, PAD_CROSS);
+    if (psxe_button_pressed(pad, PAD_START)) {
+        psxe_engine_stop(engine);
+    }
+}
+
+static void demo_render(psxe_engine *engine, void *user_data) {
+    const demo_state *state = user_data;
+    psxe_color color = state->cross_held ? (psxe_color){ 28, 90, 56 }
+                                        : (psxe_color){ 20, 28, 48 };
+    psxe_ui_panel(&engine->renderer, 0, 0, 320, 240, color, false);
+    psxe_ui_text(&engine->renderer, 24, 32, "HOLD CROSS   START TO EXIT");
+}
+
 int main(void) {
     static psxe_engine engine;
-    static my_game state;
+    static demo_state state;
     const psxe_engine_config config = {
         .render = { .width = 320, .height = 240, .video_mode = PSXE_VIDEO_NTSC,
                     .clear_color = { 0, 0, 0 }, .dither = true },
-        .memory_card = { .product_code = "BAPXE-00001", .identifier = "MYGAME",
-                         .title = "MY GAME", .format_version = 1 }
+        .memory_card = { .product_code = "BAPXE-00001", .identifier = "DEMO",
+                         .title = "PSXE DEMO", .format_version = 1 }
     };
-    const psxe_game game = { game_init, game_update, game_render, NULL, &state };
+    const psxe_game game = {
+        .update = demo_update, .render = demo_render, .user_data = &state
+    };
 
     psxe_engine_init(&engine, &config);
     psxe_engine_run(&engine, &game);
@@ -196,6 +228,7 @@ int main(void) {
 | `psxe_face` | One triangle: `vertex[3]` indices, `normal` index, `uv[3][2]` offsets from the texture's base `u`/`v`, flat `color`, material `flags`. |
 | `psxe_mesh` | Borrowed `vertices`, `normals`, `faces` arrays with their counts, plus an optional `texture`. |
 | `psxe_light`, `psxe_light_set`, `psxe_light_type`, `psxe_light_falloff` | Light values and the renderer's fixed set. See [Lights](#lights--psxe_light). |
+| `psxe_render_buffer` | One `DISPENV`, `DRAWENV`, ordering table, and GPU packet arena. The renderer owns and swaps its two buffers. |
 | `psxe_renderer` | Double buffers, frame state, and the diagnostics described below. `ordering_table`/`ot_length` address the active pass. `next_packet`/`packet_end` bound the active packet arena. |
 
 ### `void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *config)`
@@ -207,6 +240,10 @@ light set through `psxe_renderer_set_directional_light` (direction
 `{-2048,-2048,-2048}` normalized to `ONE`, color `{220,220,220}`, ambient
 `{48,48,48}`) and a default camera at the origin with projection 160, and
 enables display. `psxe_engine_init` calls it for you.
+
+The two framebuffers occupy `(0, 0)` through `(width - 1, 2 * height - 1)` in
+VRAM. Choose dimensions that fit this layout and stay clear of the debug font.
+The engine sample uses 320 × 240.
 
 ### `void psxe_renderer_begin_frame(psxe_renderer *renderer)`
 
@@ -273,14 +310,15 @@ psxe_renderer_set_directional_light(&engine->renderer, &sun,
 
 ### `bool psxe_texture_load_tim(psxe_texture *texture, const uint32_t *tim_data)`
 
-Parses an in-memory TIM, uploads pixels (and its CLUT, if present) to the VRAM
-position stored in the TIM, waits for the transfer, and fills `texture`. `u` is
+Uploads an authored, word-aligned TIM to the VRAM coordinates stored in that
+file. It queues pixels and any CLUT, waits for GPU work, and fills `texture`. `u` is
 the texel offset inside the 64-halfword-aligned texture page: `(x & 63) * 4`
 for 4-bit, `(x & 63) * 2` for 8-bit, `x & 63` for 16-bit TIMs.
-Returns `false` for `NULL` or an unparsable TIM. It does not check the TIM's
-VRAM rectangle against the framebuffers or the font at `(960, 0)`: place
-textures in free VRAM when you author the TIM. Call it during `init` or a
-loading screen, never every frame.
+Returns `false` for `NULL` or when the SDK TIM parser rejects the header. Use
+complete embedded TIM data and reserve its authored pixel and CLUT rectangles
+before using a managed VRAM pool. For a sized buffer loaded from disc, use
+[`psxe_vram_load_tim`](#asset-memory--memoryh-and-vramh), which checks block
+sizes and finds free VRAM. Upload during initialization or between frame builds.
 
 ```c
 extern const uint32_t crate_tim[];   /* embedded with psn00bsdk_target_incbin */
@@ -303,15 +341,15 @@ the mesh by `transform` and the current camera, then for each face:
 - skips faces whose ordering-table index falls outside `[2, ot_length)`
   (`PSXE_OT_LENGTH` for the main pass, the target's `ot_length` in a
   render-target pass).
-  There is **no near-plane clipping**: faces too close to or behind the camera
-  disappear rather than being cut;
+  Near-plane crossings can distort or disappear because the renderer submits
+  projected triangles without clipping them against the near plane;
 - emits `POLY_FT3` when `TEXTURED` is set and `mesh->texture` is valid,
   otherwise `POLY_F3`;
 - with `LIT` and a valid `normal` index, multiplies the face `color` by the
   light. For textured faces, color `{128,128,128}` means unmodified texels;
 - untextured `SEMITRANSPARENT` faces get a small state packet so they blend
-  with the requested mode (half for `psxe_draw_mesh`). If that packet does not
-  fit, the face is dropped rather than drawn with the wrong blend.
+  with the requested mode (half for `psxe_draw_mesh`). The face and state
+  command share one reservation and are dropped together when it fails.
 
 Ignores `NULL` renderer, mesh, transform, vertices, or faces. Faces are flat
 shaded (no Gouraud).
@@ -331,11 +369,11 @@ psxe_draw_mesh(&engine->renderer, &tri, &t);
 ### `void psxe_draw_sprite(psxe_renderer *renderer, const psxe_texture *texture, int16_t x, int16_t y, int16_t width, int16_t height, psxe_color tint, bool semitransparent)`
 
 Immediate-mode shortcut for an unscaled `psxe_sprite`: draws `width` x `height`
-texels of `texture` from its base `u`/`v` at pixel `(x, y)` in bucket 1 (above
-meshes, below text), half-blended when `semitransparent`. `tint`
-`{128,128,128}` is neutral. Ignores `NULL`, invalid textures, and non-positive
-sizes. Use a [`psxe_sprite`](#sprites--psxe_sprite) for atlas regions,
-scaling, flipping, other blend modes, solid fills, or other layers.
+texels from the texture's base `u`/`v` at screen pixel `(x, y)` in bucket 1.
+`semitransparent` selects half blending for texels with the STP bit set.
+`tint` `{128,128,128}` is neutral. Ignores `NULL`, invalid textures, and
+non-positive sizes. Use [`psxe_sprite`](#sprites--psxe_sprite) for atlas regions,
+scaling, flipping, other blend modes, solid fills, and other layers.
 
 ```c
 psxe_draw_sprite(&engine->renderer, &icon, 280, 8, 32, 32, (psxe_color){ 128, 128, 128 }, false);
@@ -344,13 +382,14 @@ psxe_draw_sprite(&engine->renderer, &icon, 280, 8, 32, 32, (psxe_color){ 128, 12
 ### `void psxe_ui_panel(psxe_renderer *renderer, int16_t x, int16_t y, int16_t width, int16_t height, psxe_color color, bool semitransparent)`
 
 Draws a solid rectangle in bucket 1. With `semitransparent`, it is blended 50/50
-with what is behind it.
+with what is behind it. Ignores `NULL` renderers and non-positive dimensions.
 
 ### `void psxe_ui_text(psxe_renderer *renderer, int16_t x, int16_t y, const char *text)`
 
-Draws text with the SDK debug font in bucket 0 (always on top). Packet cost is
-one small sprite per character plus one state packet. The samples use
-uppercase ASCII.
+Draws a null-terminated string with PSn00bSDK's debug font in bucket 0. ASCII
+letters are shown in uppercase. Spaces advance without emitting a glyph, and
+`\n` starts a new 8-pixel line. The reservation uses the full string length as
+an upper bound. Actual usage is one sprite per glyph plus one state packet.
 
 ```c
 psxe_ui_panel(&engine->renderer, 4, 4, 312, 20, (psxe_color){ 0, 0, 40 }, true);
@@ -370,10 +409,9 @@ psxe_ui_text(&engine->renderer, 10, 10, "PRESS START");
 
 ## Materials and effects
 
-A `psxe_material` changes how a mesh or sprite looks **without touching the
-shared, immutable mesh data**. Every option is applied while packets are built
-or through GPU state bits: none adds GTE work, and `PSXE_EFFECT_UNLIT` and
-`PSXE_EFFECT_UNTEXTURED` remove work.
+A `psxe_material` sets appearance per instance. Store it on an object, sprite,
+or scene entity, or pass it directly to a mesh draw. `PSXE_EFFECT_UNLIT` skips
+mesh lighting. `PSXE_EFFECT_UNTEXTURED` uses the smaller flat-color packets.
 
 ```c
 typedef struct psxe_material {
@@ -419,21 +457,21 @@ blend.
 | Function | Behavior |
 | --- | --- |
 | `psxe_material psxe_material_default(void)` | No texture override, color `{128,128,128}`, `PSXE_COLOR_FACE`, no effects, `PSXE_BLEND_HALF`, `light_exclude = 0`. Drawing with it looks the same as drawing with no material. |
-| `void psxe_material_set_texture(psxe_material *m, const psxe_texture *t)` | Sets the texture override; `NULL` returns to the mesh's own texture. |
-| `void psxe_material_set_color(psxe_material *m, psxe_color c, psxe_color_mode mode)` | Sets color and color mode. |
-| `void psxe_material_set_effects(psxe_material *m, uint8_t effects, psxe_blend_mode blend)` | Replaces the effect bits and blend mode. |
-| `void psxe_material_set_light_exclude(psxe_material *m, uint8_t layers)` | Lights whose `layers` share a bit with this mask are skipped for the mesh. Default `0` (all lights apply). |
+| `void psxe_material_set_texture(psxe_material *material, const psxe_texture *texture)` | Sets the texture override; `NULL` returns to the mesh's own texture. |
+| `void psxe_material_set_color(psxe_material *material, psxe_color color, psxe_color_mode mode)` | Sets color and color mode. |
+| `void psxe_material_set_effects(psxe_material *material, uint8_t effects, psxe_blend_mode blend)` | Replaces the effect bits and blend mode. |
+| `void psxe_material_set_light_exclude(psxe_material *material, uint8_t layers)` | Lights whose `layers` share a bit with this mask are skipped for the mesh. Default `0` (all lights apply). |
 
-All ignore a `NULL` material.
+The setters ignore a `NULL` material. `psxe_material_default` returns a value.
 
 ### `void psxe_draw_mesh_material(psxe_renderer *renderer, const psxe_mesh *mesh, const psxe_transform *transform, const psxe_material *material)`
 
-`psxe_draw_mesh` with an optional override (`NULL` = none). A material texture
-replaces `mesh->texture` **for faces that carry `PSXE_MATERIAL_TEXTURED`**,
-reusing their UVs as offsets from the new texture's base `u`/`v`. Faces
-without that flag stay untextured, and UVs beyond a smaller replacement
-texture wrap inside its 256x256 texture page. Material effects are OR-ed with
-the per-face flags.
+Draws with an optional override. A non-`NULL` material texture replaces
+`mesh->texture` for faces carrying `PSXE_MATERIAL_TEXTURED`. Their UVs stay
+relative to the texture's base `u`/`v`. Use compatible UV ranges when swapping
+textures because the renderer stores coordinates as 8-bit page offsets and
+does not bound them to the new texture rectangle. A `NULL` material uses the
+mesh defaults.
 
 ```c
 psxe_material ghost = psxe_material_default();
@@ -444,12 +482,10 @@ psxe_draw_mesh_material(&engine->renderer, &player_mesh, &ghost_transform, &ghos
 
 ## Lights — `psxe_light`
 
-Lighting stays flat per face (one `NCCS` per lit face), but any number of
-lights can now affect a scene. The GTE has three light rows, so **for every
-mesh draw** the renderer ranks the candidate lights by their contribution at
-the mesh's origin and keeps the best three. Everything else becomes ambient.
-This runs on the CPU, before the mesh's GTE state is installed, and only for
-meshes that can light (`PSXE_EFFECT_UNLIT` or a mesh without normals skips it).
+Lighting is flat per face. Before drawing a mesh with normals, the renderer
+ranks lights by contribution at its origin and places the strongest three
+directional or point lights in the GTE light rows. Other directional or point
+lights contribute to ambient. A mesh with `PSXE_EFFECT_UNLIT` skips selection.
 
 ```c
 typedef struct psxe_light {
@@ -498,31 +534,32 @@ typedef struct psxe_light_set {
    `max(0, cos)` over all normal directions (`lights_folded`).
 5. The back color clamps at 255 per channel.
 
-Attenuation is evaluated once at the mesh origin, not per vertex or face, so a
-big mesh next to a point light is lit evenly. Split large level geometry into
-several meshes if you need local pools of light.
+Point-light direction and attenuation are shared by the whole mesh. Face
+normals still affect brightness. Split large level geometry into smaller meshes
+when a single light needs to produce different falloff across a surface.
 
 | Function | Behavior |
 | --- | --- |
-| `void psxe_light_init(psxe_light *l, psxe_light_type type)` | White, intensity `ONE`, enabled, `layers = PSXE_LIGHT_LAYER_DEFAULT` (1), direction `{0,-ONE,0}` (from above), position 0, radius 1024, `PSXE_FALLOFF_LINEAR`. Ignores `NULL`. |
-| `void psxe_light_set_color(psxe_light *l, psxe_color c, int32_t intensity)` | Sets color and intensity (negative = 0). |
-| `void psxe_light_set_direction(psxe_light *l, int32_t x, int32_t y, int32_t z)` | Normalizes any non-zero vector to length `ONE`; zero is ignored. Assigning `direction` directly skips normalization, so keep it unit length. |
-| `void psxe_light_set_position(psxe_light *l, int32_t x, int32_t y, int32_t z)` | Sets the point-light position. |
-| `void psxe_light_set_range(psxe_light *l, int32_t radius, psxe_light_falloff f)` | Sets radius (negative = 0) and falloff curve. |
-| `void psxe_light_set_layers(psxe_light *l, uint8_t layers)` | Layer bits for material masks (`PSXE_LIGHT_LAYER_ALL` = `0xff`). |
-| `void psxe_light_set_enabled(psxe_light *l, bool enabled)` | Toggles the light without removing it. |
-| `void psxe_renderer_clear_lights(psxe_renderer *r)` | Empties the renderer's set and keeps the ambient color. |
-| `bool psxe_renderer_add_light(psxe_renderer *r, const psxe_light *l)` | Copies one light into the set. `false` for `NULL`, or when full (also increments `lights_dropped`). |
-| `uint16_t psxe_renderer_set_lights(psxe_renderer *r, const psxe_light *lights, uint16_t count)` | Replaces the set with a copy of `lights`. Returns how many were stored; any extra count as dropped. |
-| `psxe_light *psxe_renderer_light(psxe_renderer *r, uint16_t index)` | Mutable access to stored light `index` (for animation), or `NULL`. |
-| `void psxe_renderer_set_ambient(psxe_renderer *r, psxe_color ambient)` | Sets the set-wide ambient color. |
-| `void psxe_draw_mesh_lights(psxe_renderer *r, const psxe_mesh *m, const psxe_transform *t, const psxe_material *mat, const psxe_light *extra, uint16_t extra_count)` | `psxe_draw_mesh_material` that also ranks `extra` world-space lights next to the renderer's set. `extra` is borrowed for this call only. `psxe_scene_render` uses it for entity lights. |
-| `void psxe_draw_light_marker(psxe_renderer *r, const psxe_light *l, int16_t size)` | Debug: a solid `size`×`size` square in the light's color at an enabled point light's projected position, in bucket 1 (above meshes). Projected on the CPU with the current camera; skipped behind the camera. Costs one `TILE`. |
+| `void psxe_light_init(psxe_light *light, psxe_light_type type)` | White, intensity `ONE`, enabled, `layers = PSXE_LIGHT_LAYER_DEFAULT` (1), direction `{0,-ONE,0}` (from above), position 0, radius 1024, `PSXE_FALLOFF_LINEAR`. Ignores `NULL`. |
+| `void psxe_light_set_color(psxe_light *light, psxe_color color, int32_t intensity)` | Sets color and intensity (negative = 0). |
+| `void psxe_light_set_direction(psxe_light *light, int32_t x, int32_t y, int32_t z)` | Normalizes any non-zero vector to length `ONE`; zero is ignored. Assigning `direction` directly skips normalization, so keep it unit length. |
+| `void psxe_light_set_position(psxe_light *light, int32_t x, int32_t y, int32_t z)` | Sets the point-light position. |
+| `void psxe_light_set_range(psxe_light *light, int32_t radius, psxe_light_falloff falloff)` | Sets radius and falloff. Negative radius becomes zero, and an invalid falloff value selects linear. |
+| `void psxe_light_set_layers(psxe_light *light, uint8_t layers)` | Layer bits for material masks (`PSXE_LIGHT_LAYER_ALL` = `0xff`). |
+| `void psxe_light_set_enabled(psxe_light *light, bool enabled)` | Toggles the light without removing it. |
+| `void psxe_renderer_clear_lights(psxe_renderer *renderer)` | Empties the renderer's set and keeps the ambient color. |
+| `bool psxe_renderer_add_light(psxe_renderer *renderer, const psxe_light *light)` | Copies one light into the set. `false` for `NULL`, or when full (also increments `lights_dropped`). |
+| `uint16_t psxe_renderer_set_lights(psxe_renderer *renderer, const psxe_light *lights, uint16_t count)` | Replaces the stored lights and preserves ambient. Returns the stored count and counts entries beyond capacity as dropped. A `NULL` array clears the set. |
+| `psxe_light *psxe_renderer_light(psxe_renderer *renderer, uint16_t index)` | Mutable access to stored light `index` (for animation), or `NULL`. |
+| `void psxe_renderer_set_ambient(psxe_renderer *renderer, psxe_color ambient)` | Sets the set-wide ambient color. |
+| `void psxe_draw_mesh_lights(psxe_renderer *renderer, const psxe_mesh *mesh, const psxe_transform *transform, const psxe_material *material, const psxe_light *extra_lights, uint16_t extra_count)` | `psxe_draw_mesh_material` that also ranks `extra` world-space lights next to the renderer's set. `extra` is borrowed for this call only. `psxe_scene_render` uses it for entity lights. |
+| `void psxe_draw_light_marker(psxe_renderer *renderer, const psxe_light *light, int16_t size)` | Debug: a solid `size`×`size` square in the light's color at an enabled point light's projected position, in bucket 1 (above meshes). Projected on the CPU with the current camera; skipped behind the camera. Costs one `TILE`. |
 
 The light set is copied by value. Render-target passes save it at
 `psxe_render_target_begin` and restore it at `end`, so a pass can install its
-own lights. The light counters on `psxe_renderer` are summed over every lit
-mesh draw in the frame, so the same light counts once for each mesh it reaches.
+own lights. `lights_considered`, `lights_applied`, and `lights_folded` sum over
+mesh draws. `lights_dropped` tracks additions rejected by the renderer's set.
+Reacquire borrowed pointers from `psxe_renderer_light` after replacing the set.
 
 ```c
 psxe_light sun, torch;
@@ -565,17 +602,17 @@ your game state lives. Scene entities carry the same `material` field (see
 
 | Function | Behavior |
 | --- | --- |
-| `void psxe_object_init(psxe_object *o, const psxe_mesh *mesh)` | Identity transform, default material, `visible = true`. |
-| `void psxe_object_set_mesh(psxe_object *o, const psxe_mesh *mesh)` | Swaps the mesh (for example a low-detail version). |
-| `void psxe_object_set_texture(psxe_object *o, const psxe_texture *t)` | Changes the texture of an existing object; `NULL` returns to `mesh->texture`. |
-| `void psxe_object_set_color(psxe_object *o, psxe_color c, psxe_color_mode mode)` | See color modes above. |
-| `void psxe_object_set_effects(psxe_object *o, uint8_t effects, psxe_blend_mode blend)` | Replaces effect bits and blend mode. |
-| `void psxe_object_set_position(psxe_object *o, int32_t x, int32_t y, int32_t z)` | World units. |
-| `void psxe_object_translate(psxe_object *o, int32_t dx, int32_t dy, int32_t dz)` | Adds to the position. |
-| `void psxe_object_set_rotation(psxe_object *o, int16_t x, int16_t y, int16_t z)` | 4096 = full turn. |
-| `void psxe_object_rotate(psxe_object *o, int16_t dx, int16_t dy, int16_t dz)` | Adds and wraps to `0..4095`. |
-| `void psxe_object_set_scale(psxe_object *o, int32_t scale)` | Uniform scale, `ONE` = 1.0. Set `transform.scale` directly for non-uniform scale. |
-| `void psxe_object_draw(psxe_renderer *r, const psxe_object *o)` | Draws if `visible` (via `psxe_draw_mesh_material`). |
+| `void psxe_object_init(psxe_object *object, const psxe_mesh *mesh)` | Identity transform, default material, `visible = true`. |
+| `void psxe_object_set_mesh(psxe_object *object, const psxe_mesh *mesh)` | Sets the borrowed mesh and preserves transform and material. Pass `NULL` to detach it. |
+| `void psxe_object_set_texture(psxe_object *object, const psxe_texture *texture)` | Changes the texture of an existing object; `NULL` returns to `mesh->texture`. |
+| `void psxe_object_set_color(psxe_object *object, psxe_color color, psxe_color_mode mode)` | See color modes above. |
+| `void psxe_object_set_effects(psxe_object *object, uint8_t effects, psxe_blend_mode blend)` | Replaces effect bits and blend mode. |
+| `void psxe_object_set_position(psxe_object *object, int32_t x, int32_t y, int32_t z)` | World units. |
+| `void psxe_object_translate(psxe_object *object, int32_t dx, int32_t dy, int32_t dz)` | Adds to the position. |
+| `void psxe_object_set_rotation(psxe_object *object, int16_t x, int16_t y, int16_t z)` | Assigns the three rotation components. `4096` is one full turn. |
+| `void psxe_object_rotate(psxe_object *object, int16_t dx, int16_t dy, int16_t dz)` | Adds and wraps to `0..4095`. |
+| `void psxe_object_set_scale(psxe_object *object, int32_t scale)` | Uniform scale, `ONE` = 1.0. Set `transform.scale` directly for non-uniform scale. |
+| `void psxe_object_draw(psxe_renderer *renderer, const psxe_object *object)` | Draws if `visible` (via `psxe_draw_mesh_material`). |
 
 All ignore `NULL` objects.
 
@@ -619,24 +656,25 @@ How a sprite is drawn:
 | Region size equals on-screen size, no flip | `SPRT` + texture-page state packet (cheapest textured path). |
 | Region size differs (scaling) or flipped | One textured quad (`POLY_FT4`). |
 
-`material.color` tints textured sprites (`{128,128,128}` = unchanged) and is
-the fill color of solid ones; `color_mode` and `UNLIT` do not apply to
-sprites. Region texel coordinates are clamped to the 0..255 range of the
-texture page. A flipped region drops its last texel column/row, because the
-GPU never draws a polygon's right and bottom edge. `layer` values beyond the
-current ordering table clamp to its last bucket.
+`material.color` tints textured sprites (`{128,128,128}` is neutral) and fills
+solid sprites. Sprite drawing ignores `color_mode` and `PSXE_EFFECT_UNLIT`.
+Keep atlas regions inside the source texture and its 256 × 256 texel page.
+The unscaled `SPRT` path stores its base coordinates as 8-bit values. The quad
+path clamps its UV endpoints and uses mirrored endpoints for flips. Layer
+values beyond the active ordering table select its last bucket.
 
 | Function | Behavior |
 | --- | --- |
-| `void psxe_sprite_init(psxe_sprite *s, const psxe_texture *t)` | Position 0,0; region = whole texture (clamped to 256); size = region size (16x16 if `t` is `NULL`/invalid); `layer = 1`; default material; visible. |
-| `void psxe_sprite_set_texture(psxe_sprite *s, const psxe_texture *t)` | Changes the texture of an existing sprite. Resets the region to the whole new texture; keeps position, on-screen size (unless it was 0), color, effects, and layer. `NULL` makes it a solid rectangle. |
-| `void psxe_sprite_set_region(psxe_sprite *s, uint8_t u, uint8_t v, uint16_t w, uint16_t h)` | Selects an atlas cell or animation frame. Does not change the on-screen size. |
-| `void psxe_sprite_set_position(psxe_sprite *s, int16_t x, int16_t y)` / `psxe_sprite_move(s, dx, dy)` | Screen pixels. |
-| `void psxe_sprite_set_size(psxe_sprite *s, int16_t w, int16_t h)` | On-screen size; differs from the region → scaled. |
-| `void psxe_sprite_set_color(psxe_sprite *s, psxe_color c)` | Tint or fill color. |
-| `void psxe_sprite_set_effects(psxe_sprite *s, uint8_t effects, psxe_blend_mode blend)` | For example `PSXE_EFFECT_FLIP_X \| PSXE_EFFECT_SEMITRANSPARENT`. |
-| `void psxe_sprite_set_layer(psxe_sprite *s, uint16_t layer)` | 0 = with text, 1 = UI (default), larger = among/behind meshes. |
-| `void psxe_sprite_draw(psxe_renderer *r, const psxe_sprite *s)` | Draws if visible and the size is positive. |
+| `void psxe_sprite_init(psxe_sprite *sprite, const psxe_texture *texture)` | Creates a visible sprite at `(0, 0)` and bucket 1. A valid texture sets the size from its region, clamped to 256 per axis. `NULL` creates a 16 × 16 solid sprite. A non-`NULL`, invalid texture starts at zero size. |
+| `void psxe_sprite_set_texture(psxe_sprite *sprite, const psxe_texture *texture)` | Resets the source region. A valid texture supplies the on-screen size if either dimension is non-positive. An absent or invalid texture selects the solid path using the existing size. |
+| `void psxe_sprite_set_region(psxe_sprite *sprite, uint8_t u, uint8_t v, uint16_t width, uint16_t height)` | Selects an atlas cell or animation frame. Does not change the on-screen size. |
+| `void psxe_sprite_set_position(psxe_sprite *sprite, int16_t x, int16_t y)` | Sets the top-left screen position in pixels. |
+| `void psxe_sprite_move(psxe_sprite *sprite, int16_t dx, int16_t dy)` | Adds pixel offsets to the current position. |
+| `void psxe_sprite_set_size(psxe_sprite *sprite, int16_t width, int16_t height)` | On-screen size; differs from the region → scaled. |
+| `void psxe_sprite_set_color(psxe_sprite *sprite, psxe_color color)` | Tint or fill color. |
+| `void psxe_sprite_set_effects(psxe_sprite *sprite, uint8_t effects, psxe_blend_mode blend)` | For example `PSXE_EFFECT_FLIP_X \| PSXE_EFFECT_SEMITRANSPARENT`. |
+| `void psxe_sprite_set_layer(psxe_sprite *sprite, uint16_t layer)` | 0 = with text, 1 = UI (default), larger = among/behind meshes. |
+| `void psxe_sprite_draw(psxe_renderer *renderer, const psxe_sprite *sprite)` | Draws if visible and the size is positive. |
 
 All ignore `NULL` sprites.
 
@@ -677,17 +715,22 @@ typedef struct psxe_render_target_config {
 
 | Function | Behavior |
 | --- | --- |
-| `bool psxe_render_target_init(psxe_render_target *t, const psxe_renderer *r, const psxe_render_target_config *c)` | Validates and fills `t`. Returns `false` (and leaves `t` invalid) for `NULL` arguments, bad sizes/alignment, a rectangle that leaves VRAM (1024x512), crosses a 256x256 texture-page boundary (`(x & 63) + width > 256` or `(y & 255) + height > 256`), overlaps the two framebuffers or the debug font at `(960, 0)`–`(991, 32)`, `ot_length` outside 3..`PSXE_OT_LENGTH`, or `depth_shift > 15`. It does not check overlap with your TIMs or other targets. |
-| `bool psxe_render_target_begin(psxe_renderer *r, const psxe_render_target *t)` | Starts a pass. From now until `end`, every `psxe_draw_*`, `psxe_object_draw`, `psxe_sprite_draw`, `psxe_scene_render`, and `psxe_ui_*` call goes into the target, with the GTE screen center at the target's center. Returns `false` if a pass is already open, the target is invalid, or the packet arena cannot hold the pass's ordering table and two state packets (counted in `dropped_primitives`). Increments `target_passes`. |
-| `void psxe_render_target_end(psxe_renderer *r)` | Returns drawing to the main ordering table and restores the camera, projection, depth shift, and screen center that were active at `begin`. No-op without an open pass. `psxe_renderer_end_frame` calls it if you forget. |
-| `const psxe_texture *psxe_render_target_texture(const psxe_render_target *t)` | The 16-bit texture view (`clut = 0`, size = target size), or `NULL` if invalid. Valid for the target's whole lifetime; it shows whatever the last executed pass drew. |
+| `bool psxe_render_target_init(psxe_render_target *target, const psxe_renderer *renderer, const psxe_render_target_config *config)` | Validates the configuration and fills `target` with a texture view. Returns `false` and invalidates the destination on a bad configuration. |
+| `bool psxe_render_target_begin(psxe_renderer *renderer, const psxe_render_target *target)` | Starts a pass. From now until `end`, every `psxe_draw_*`, `psxe_object_draw`, `psxe_sprite_draw`, `psxe_scene_render`, and `psxe_ui_*` call goes into the target, with the GTE screen center at the target's center. Returns `false` if a pass is already open, the target is invalid, or the packet arena cannot hold the pass's ordering table and two state packets (counted in `dropped_primitives`). Increments `target_passes`. |
+| `void psxe_render_target_end(psxe_renderer *renderer)` | Returns drawing to the main ordering table and restores the camera, projection, screen center, depth shift, and light set. A call without an open pass has no effect. `psxe_renderer_end_frame` also closes an open pass. |
+| `const psxe_texture *psxe_render_target_texture(const psxe_render_target *target)` | Returns the 16-bit texture view with `clut = 0`, or `NULL` if invalid. The view borrows the initialized target and samples the last executed pass. |
 
-Rules and costs:
+The rectangle must fit in 1024 × 512 VRAM and inside one 256 × 256 texture
+page. For a 16-bit target, `(x & 63) + width` and `(y & 255) + height` must
+each be at most 256. X and width must be 16-pixel aligned. Width is `16..256`,
+height is `1..256`, `ot_length` is `3..PSXE_OT_LENGTH`, and `depth_shift` is
+`0..15`. Initialization checks overlap with the two framebuffers and debug
+font. Account for other render targets and textures when planning reservations.
 
 - **Order.** Passes execute before the main pass, in the order they began, so
   the main pass and any later pass can sample an earlier target. Never sample a
   target inside its own pass.
-- **Budget.** A pass takes `ot_length * 4` bytes plus 72 bytes from the current
+- **Budget.** A pass takes `ot_length * sizeof(uint32_t) + 2 * sizeof(DR_ENV)` bytes from the current
   frame's packet arena, plus the packets of everything drawn into it. It also
   costs GPU fill time for the clear and for every pixel drawn. Skip the pass on
   some frames (for example every other frame) to halve the cost: VRAM keeps the
@@ -702,8 +745,9 @@ Rules and costs:
   near-black colors in the pass if holes are unwanted. Rendered pixels have the
   STP bit clear, so a semi-transparent primitive using the target texture does
   not blend.
-- **VRAM.** One image; the target is not double buffered. The previous frame's
-  display list always finishes before the next frame's begins, so this is safe.
+- **VRAM.** The target occupies one persistent VRAM rectangle. Reserve it
+  with `psxe_vram_reserve` before managed uploads. The renderer waits for the
+  previous display list before submitting the next one.
 
 ```c
 static psxe_render_target monitor;
@@ -766,9 +810,12 @@ typedef struct psxe_scene {
 } psxe_scene;
 ```
 
-A handle is valid only while its slot is active and the generations match.
-Destroying an entity bumps its generation, so old handles stop working even if
-the slot is reused.
+A handle resolves while its slot is active and the generations match.
+Destroying an entity increments its 16-bit generation. Keep the handle between
+frames and resolve it when needed. Discard handles when their entity dies.
+`PSXE_SCENE_NO_LIGHT` is the internal `light_slot` sentinel, distinct from
+`UINT16_MAX`, the invalid entity index. `psxe_scene_init` starts a new pool
+lifetime. Discard any prior handles and borrowed pointers before reusing it.
 
 | Function | Behavior |
 | --- | --- |
@@ -782,7 +829,7 @@ the slot is reused.
 | `bool psxe_scene_clear_light(psxe_scene *scene, psxe_entity_id id)` | Detaches and frees the entity's light. `false` if it had none. `psxe_scene_destroy` does this for you, so stale handles never leave a light behind. |
 | `psxe_light *psxe_scene_light(psxe_scene *scene, psxe_entity_id id)` | Mutable entity-local light (toggle `enabled`, change color), or `NULL`. |
 | `bool psxe_scene_light_world(const psxe_scene *scene, psxe_entity_id id, psxe_light *out)` | Writes the light transformed to world space (for `psxe_draw_light_marker` or gameplay). |
-| `uint16_t psxe_scene_gather_lights(const psxe_scene *scene, psxe_light *out, uint16_t capacity)` | Writes the world-space lights of every active entity whose light is enabled, whether or not its mesh is visible, and returns the count. Pass the result to `psxe_draw_mesh_lights` so objects outside the scene get the same lights. |
+| `uint16_t psxe_scene_gather_lights(const psxe_scene *scene, psxe_light *out, uint16_t capacity)` | Writes up to `capacity` world-space lights from active entities with enabled lights, regardless of mesh visibility. Returns the number written. Pass this array and count to `psxe_draw_mesh_lights` for objects outside the scene. |
 
 ```c
 psxe_entity_id id = psxe_scene_create(&scene);
@@ -791,15 +838,17 @@ if (e != NULL) {
     e->mesh = &cube_mesh;
     e->transform.position.vz = 900;
     psxe_material_set_texture(&e->material, &crate_tex);   /* per-entity texture */
+    psxe_light bulb;
+    psxe_light_init(&bulb, PSXE_LIGHT_POINT);
+    psxe_light_set_position(&bulb, 0, -100, 0);
+    psxe_light_set_range(&bulb, 600, PSXE_FALLOFF_LINEAR);
+    if (!psxe_scene_set_light(&scene, id, &bulb)) {
+        /* Leave the entity visible without its local light. */
+    }
 }
-/* a lamp that carries its own point light */
-psxe_light bulb;
-psxe_light_init(&bulb, PSXE_LIGHT_POINT);
-psxe_light_set_range(&bulb, 600, PSXE_FALLOFF_LINEAR);
-psxe_scene_set_light(&scene, id, &bulb);   /* follows e->transform */
-/* later */
-psxe_scene_destroy(&scene, id);            /* also frees the light */
-/* psxe_scene_get(&scene, id) now returns NULL */
+
+/* Later, during unload. This also frees the attached light. */
+psxe_scene_destroy(&scene, id);
 ```
 
 ## Input — `input.h`
@@ -813,6 +862,10 @@ typedef struct psxe_pad_state {
     bool rumble_supported;             /* motor mapping succeeded */
 } psxe_pad_state;
 ```
+
+`psxe_input` owns the two snapshots and the per-port motor requests. Initialize
+it once and treat snapshots returned by `psxe_input_pad` as read-only. The next
+poll updates those snapshots in place.
 
 Buttons (`PadButton` from the SDK's `psxpad.h`): `PAD_SELECT`, `PAD_L3`,
 `PAD_R3`, `PAD_START`, `PAD_UP`, `PAD_RIGHT`, `PAD_DOWN`, `PAD_LEFT`, `PAD_L2`,
@@ -832,55 +885,164 @@ operations. Standalone callers should leave BIOS pad polling disabled.
 | --- | --- |
 | `void psxe_input_init(psxe_input *input)` | Initializes snapshots and motor state. Called by `psxe_engine_init`. |
 | `void psxe_input_poll(psxe_input *input)` | Polls both SIO0 ports, converts active-low data to `held`, and computes `pressed`/`released` against the previous poll. Called by the engine before every `update`. |
-| `const psxe_pad_state *psxe_input_pad(const psxe_input *input, unsigned int port)` | Port 0 or 1, otherwise `NULL`. |
+| `const psxe_pad_state *psxe_input_pad(const psxe_input *input, unsigned int port)` | Returns the snapshot for port 0 or 1, including disconnected pads. Returns `NULL` for an invalid port or context. |
 | `bool psxe_button_held(const psxe_pad_state *pad, PadButton button)` | Button down this frame. |
 | `bool psxe_button_pressed(const psxe_pad_state *pad, PadButton button)` | Went down this frame. |
 | `bool psxe_button_released(const psxe_pad_state *pad, PadButton button)` | Went up this frame. |
 | `bool psxe_input_rumble(psxe_input *input, unsigned int port, bool small, uint8_t large, uint8_t frames)` | Requests small on/off and large intensity 0–255 for the next `frames` polls. Pass zero frames to stop on the next poll. Returns false when the port has no negotiated rumble. |
 | `void psxe_input_stop_rumble(psxe_input *input)` | Clears both requests and immediately sends zero motor levels to configured pads. Called by the engine on exit. |
 
-The button helpers return `false` for a `NULL` pad, so a missing port can be
-passed straight through.
+The button helpers return `false` for a `NULL` pad. They check for any matching
+bit in the relevant mask. Use an explicit mask comparison for a chord that
+requires all its buttons.
 
 ```c
 const psxe_pad_state *pad = psxe_input_pad(&engine->input, 0);
-if (psxe_button_pressed(pad, PAD_CROSS)) { jump(); }
+if (psxe_button_pressed(pad, PAD_CROSS)) {
+    jump();
+    /* A 100 ms pulse at either regional frame rate. */
+    psxe_input_rumble(&engine->input, 0, true, 80,
+                      (uint8_t)(engine->ticks_per_second / 10u));
+}
 if (psxe_button_held(pad, PAD_SQUARE)) { charge++; }
 if (psxe_button_released(pad, PAD_SQUARE)) { fire(charge); charge = 0; }
-if ((pad->held & (PAD_L1 | PAD_R1)) == (PAD_L1 | PAD_R1)) { reset_camera(); }
+const uint16_t chord = PAD_L1 | PAD_R1;
+if (pad != NULL && (pad->held & chord) == chord) { reset_camera(); }
 ```
 
 ## CD-ROM — `cd.h`
 
-Call from the main thread with interrupts enabled. The CD service owns the
-single drive and its PSn00bSDK callbacks. Audio playback and sector reads
-share the transport, so pause or stop audio before loading more data. LBAs
-start at program-area MSF 00:02:00 and have 75 sectors per second.
+Call from the game loop or a loading callback with interrupts enabled. The CD
+service owns the single drive and its PSn00bSDK callbacks. Audio playback and
+data reads share the transport. Pause or stop audio before starting a new data
+read. An LBA of zero is MSF `00:02:00`. Each second contains 75 sectors.
+
+| Type or constant | Meaning |
+| --- | --- |
+| `psxe_cd_file` | `lba` is the starting sector of a contiguous file and `size` is its logical length in bytes. Resolve it again after a disc change. |
+| `psxe_cd_drive_status` | `lid_open`, `motor_on`, `seeking`, `reading` for data or XA, and `playing` for CD-DA. |
+| `psxe_cd_sector_mode` | `PSXE_CD_DATA` uses `PSXE_CD_SECTOR_SIZE` (2048 bytes). `PSXE_CD_RAW` uses `PSXE_CD_RAW_SECTOR_SIZE` (2340 bytes, without the 12-byte sync field). |
+
+| `psxe_cd_result` | Meaning |
+| --- | --- |
+| `PSXE_CD_OK` | The call completed successfully. For playback start, the command was accepted and audio continues independently. |
+| `PSXE_CD_PENDING` | A sector transfer owns the caller's buffer. Continue polling or cancel it. |
+| `PSXE_CD_BUSY` | The drive is serving a transfer, playback, or recovery that conflicts with the requested operation. |
+| `PSXE_CD_INVALID_ARGUMENT` | A pointer, range, mode, path, alignment, or buffer size failed validation. |
+| `PSXE_CD_NOT_READY` | The drive service has yet to initialize successfully. |
+| `PSXE_CD_NOT_FOUND` | File lookup found no matching entry. |
+| `PSXE_CD_BAD_FILESYSTEM` | ISO9660 metadata or a requested file layout failed validation. |
+| `PSXE_CD_IO_ERROR` | A CD command, transfer, or transport recovery failed or timed out. |
+
+### Drive and transport
 
 | Function | Behavior |
 | --- | --- |
-| `psxe_cd_init()` | Initializes the drive after renderer/IRQ setup. Retries a pending SDK initialization with the engine's frame-based command timeout. Returns `PSXE_CD_NOT_READY` if initialization fails. Call before other CD operations. |
-| `psxe_cd_status(&status)` | Reports lid, spindle, seek, data/XA read, and CD-DA play state. May be queried during audio playback. |
-| `psxe_cd_seek(lba, audio_track)` | Waits for a logical data-header seek or a physical subchannel seek when `audio_track` is true. |
-| `psxe_cd_position(&lba)` | Reports the current physical head position from subchannel Q. Data reads use the exact requested LBA. |
-| `psxe_cd_motor_on()`, `psxe_cd_pause()`, `psxe_cd_stop()` | Spin up, pause with the spindle running, or stop transport and spindle. Pending sector reads must be cancelled or completed first. |
-| `psxe_cd_read_start(lba, sectors, mode, destination, capacity)` | Starts an IRQ-driven read into word-aligned RAM. `PSXE_CD_DATA` transfers `PSXE_CD_SECTOR_SIZE` (2048) bytes per sector. `PSXE_CD_RAW` transfers `PSXE_CD_RAW_SECTOR_SIZE` (2340) bytes per sector, including the sector header and excluding sync bytes. |
-| `psxe_cd_read_poll()`, `psxe_cd_read_wait()` | Check progress once or wait until complete. Success and errors finalize the transport before returning. The final poll may wait for the drive to pause. |
-| `psxe_cd_read_cancel()` | Disarms DMA to the caller's buffer and stops reading. May stop the spindle if pause is rejected during a seek. |
-| `uint32_t psxe_cd_sectors_read(void)` | Returns the running count of successful data and raw DMA sector transfers since boot, including filesystem reads and sectors transferred before cancellation. The unsigned counter wraps after `UINT32_MAX`. |
-| `psxe_cd_find(path, &file)` | Finds a contiguous file on a primary ISO9660 volume. Use slash or backslash, case-insensitive path components, and an optional `;1` suffix. Returns the starting LBA and byte length in `psxe_cd_file`. |
-| `psxe_cd_read_file(&file, offset, destination, size)` | Blocking exact byte-range read into caller-owned RAM. Partial sectors and unaligned destinations use a shared sector buffer. Re-resolve file extents after a disc change. |
-| `psxe_cd_play_xa(lba, file, channel, double_speed)` | Starts decoding the selected XA file/channel. The caller controls the playback range and calls pause/stop. |
-| `psxe_cd_xa_filter(file, channel)` | Changes the selected XA file/channel during playback. Channel range is 0–31. |
-| `psxe_cd_play_cdda(lba)` | Starts CD-DA on an audio track and enables track-end auto-pause. Query status or pause/stop before the next transfer. |
-| `psxe_cd_set_audio_volume(left, right)`, `psxe_cd_set_muted(muted)` | Set the SPU CD input levels (0–`0x7fff`) or mute/demute drive audio. |
+| `psxe_cd_result psxe_cd_init(void)` | Initializes the drive after renderer/IRQ setup and retries a pending SDK initialization with the engine's frame-based timeout. Subsequent calls return `PSXE_CD_OK` once initialized. |
+| `psxe_cd_result psxe_cd_status(psxe_cd_drive_status *status)` | Writes the drive state. Can be queried during audio playback. Returns `PSXE_CD_BUSY` during a sector transfer. |
+| `psxe_cd_result psxe_cd_seek(uint32_t lba, bool audio_track)` | Waits for a seek on an idle drive. `audio_track` chooses a physical subchannel seek. Use `false` for a data-header seek. |
+| `psxe_cd_result psxe_cd_position(uint32_t *lba)` | Writes the current physical head position from subchannel Q. Returns `PSXE_CD_BUSY` during a sector transfer. |
+| `psxe_cd_result psxe_cd_motor_on(void)` | Spins up an idle drive. Returns success immediately if its spindle is already running. |
+| `psxe_cd_result psxe_cd_pause(void)` | Pauses the transport with the spindle running. Complete or cancel an active sector transfer first. |
+| `psxe_cd_result psxe_cd_stop(void)` | Stops transport and spindle. Can recover a failed transport after any active transfer has been finalized. |
 
-Sector reads own access to their destination until poll, wait, or cancel
-returns a terminal result. The start call returns `PSXE_CD_PENDING` when the
-transfer begins. Treat the buffer as incomplete on error or cancellation.
-After a transport failure, `psxe_cd_stop` can recover the drive before reuse.
-The laser follows the drive's built-in seek and transport commands.
-[CD-ROM command reference](https://github.com/psx-spx/psx-spx.github.io/blob/master/docs/cdromdrive.md)
+### Sector reads and file lookup
+
+| Function | Behavior |
+| --- | --- |
+| `psxe_cd_result psxe_cd_read_start(uint32_t lba, uint32_t sectors, psxe_cd_sector_mode mode, void *destination, size_t capacity)` | Starts an IRQ-driven read into 4-byte-aligned RAM. Supply a nonzero sector count and capacity for the entire transfer at the selected stride. Returns `PSXE_CD_PENDING` once it begins. |
+| `psxe_cd_result psxe_cd_read_poll(void)` | Checks progress once. A terminal poll may wait for the drive to pause or stop. Call from the game loop while the buffer is borrowed. |
+| `psxe_cd_result psxe_cd_read_wait(void)` | Polls until the active read finishes. Keeps the caller blocked while the transfer progresses. |
+| `psxe_cd_result psxe_cd_read_cancel(void)` | Disarms DMA and pauses the drive, or stops the spindle if it cannot pause. Returns `PSXE_CD_INVALID_ARGUMENT` when there is no active sector read. |
+| `uint32_t psxe_cd_sectors_read(void)` | Returns the running count of successful data and raw DMA sector transfers since boot, including filesystem reads and sectors transferred before cancellation. The unsigned counter wraps after `UINT32_MAX`. |
+| `psxe_cd_result psxe_cd_find(const char *path, psxe_cd_file *file)` | Resolves a contiguous file on the primary ISO9660 volume. Use slash or backslash, case-insensitive path components, and an optional `;1` suffix. Writes the output on success. |
+| `psxe_cd_result psxe_cd_read_file(const psxe_cd_file *file, uint32_t offset, void *destination, size_t size)` | Reads an exact byte range into caller-owned RAM. Uses scratch storage for partial sectors or unaligned output. Returns an error if the range exceeds `file->size`. An I/O error can leave a partial result in `destination`. |
+
+Keep the DMA buffer alive through a terminal poll, wait, or cancellation. Use
+its contents only if poll or wait reported `PSXE_CD_OK`. After a transport
+failure, `psxe_cd_stop` can recover the drive before reuse. For a full file,
+prefer `psxe_cd_read_file` when its logical byte size matters.
+
+This loading helper reads the first bytes of the bundled chime. Call it after
+`psxe_engine_init` and pass a buffer of at least 48 bytes.
+
+```c
+#include <psxe/cd.h>
+
+static psxe_cd_result read_chime_header(uint8_t header[48]) {
+    psxe_cd_file file;
+    psxe_cd_result result = psxe_cd_init();
+    if (result == PSXE_CD_OK) {
+        result = psxe_cd_find("/ASSETS/CHIME.VAG", &file);
+    }
+    if (result == PSXE_CD_OK) {
+        result = psxe_cd_read_file(&file, 0, header, 48);
+    }
+    return result;
+}
+```
+
+For a sector-aligned prefetch, keep the job in static game state. Call
+`prefetch_begin` once, poll during `update`, and consume `words`
+after success. Use an LBA from a resolved file extent or disc layout.
+
+```c
+#include <psxe/cd.h>
+
+typedef struct sector_prefetch {
+    uint32_t words[PSXE_CD_SECTOR_SIZE / sizeof(uint32_t)];
+    psxe_cd_result result;
+} sector_prefetch;
+
+static psxe_cd_result prefetch_begin(sector_prefetch *job, uint32_t lba) {
+    if (job->result == PSXE_CD_PENDING) {
+        return PSXE_CD_BUSY;
+    }
+    job->result = psxe_cd_read_start(lba, 1, PSXE_CD_DATA, job->words, sizeof(job->words));
+    return job->result;
+}
+
+static psxe_cd_result prefetch_poll(sector_prefetch *job) {
+    if (job->result == PSXE_CD_PENDING) {
+        job->result = psxe_cd_read_poll();
+    }
+    return job->result;
+}
+
+static psxe_cd_result prefetch_cancel(sector_prefetch *job) {
+    if (job->result != PSXE_CD_PENDING) {
+        return PSXE_CD_INVALID_ARGUMENT;
+    }
+    psxe_cd_result result = psxe_cd_read_cancel();
+    job->result = PSXE_CD_INVALID_ARGUMENT;
+    return result;
+}
+```
+
+Initialize `result` to `PSXE_CD_INVALID_ARGUMENT` before the first request, as
+`PSXE_CD_OK` is zero. A sector read can include padding beyond the logical end
+of a file. Use `psxe_cd_file.size` when interpreting that sector.
+
+### XA and CD-DA
+
+| Function | Behavior |
+| --- | --- |
+| `psxe_cd_result psxe_cd_play_xa(uint32_t lba, uint8_t file, uint8_t channel, bool double_speed)` | Starts XA decoding on an idle drive with the given file and channel filter. Select the speed to match the authored stream. The caller manages playback boundaries. |
+| `psxe_cd_result psxe_cd_xa_filter(uint8_t file, uint8_t channel)` | Changes the filter during XA playback. The accepted channel range is `0..31`. |
+| `psxe_cd_result psxe_cd_play_cdda(uint32_t lba)` | Starts CD-DA at an audio track LBA and enables auto-pause at track end. Query drive status to observe completion before the next operation. |
+| `psxe_cd_result psxe_cd_set_audio_volume(uint16_t left, uint16_t right)` | Sets SPU CD-input volume per channel in the range `0..0x7fff`. Values outside the range return `PSXE_CD_INVALID_ARGUMENT`. |
+| `psxe_cd_result psxe_cd_set_muted(bool muted)` | Mutes or demutes drive audio without pausing the transport. Returns `PSXE_CD_BUSY` during a sector transfer. |
+
+Set the volume, then start playback at the audio track's authored LBA.
+Check the result before displaying a playing state. [CD-ROM command reference](https://github.com/psx-spx/psx-spx.github.io/blob/master/docs/cdromdrive.md)
+
+```c
+/* Call after psxe_cd_init and with the transport idle. */
+static psxe_cd_result start_music(uint32_t audio_track_lba) {
+    psxe_cd_result result = psxe_cd_set_audio_volume(0x5000, 0x5000);
+    return result == PSXE_CD_OK ? psxe_cd_play_cdda(audio_track_lba) : result;
+}
+```
 
 ## Audio — `audio.h`
 
@@ -893,6 +1055,11 @@ typedef struct psxe_audio_sample {
 } psxe_audio_sample;
 ```
 
+`psxe_audio` owns the SPU allocation cursor and next voice. Keep one initialized
+context for the hardware. Discard old sample descriptors if you reinitialize
+that context. Playback copies the descriptor's parameters to the voice
+registers, and the source VAG buffer can be released once upload succeeds.
+
 | Function | Behavior |
 | --- | --- |
 | `void psxe_audio_init(psxe_audio *audio)` | Initializes the SPU, sets master volume, resets the SPU RAM allocator to `0x1010`. Called by `psxe_engine_init`. |
@@ -903,17 +1070,45 @@ typedef struct psxe_audio_sample {
 | `void psxe_audio_stop_all(void)` | Keys off all 24 voices. Called by the engine after the loop exits. |
 | `psxe_audio_stats psxe_audio_get_stats(const psxe_audio *audio)` | Returns `used_bytes` and `free_bytes` in the aligned sample region `0x1040..0x7ffff`. Includes DMA padding. Returns zeros for a null or uninitialized context. |
 
-Uploads block on DMA; do them in `init` or during loading. Looping depends only
-on the loop flags encoded in the VAG blocks. There is no "is playing" query.
-The cube disc includes `/ASSETS/CHIME.VAG` as a resident audio example.
+Uploads block on DMA. Load during `init` or a loading transition. VAG loop
+flags control looping. Playback rotates through all 24 hardware voices and
+can replace an active one. Call `load_chime` during initialization and
+`play_chime` on a button edge.
+
+```c
+#include <psxe/psxe.h>
+
+static psxe_audio_sample chime;
+static uint32_t chime_staging[512];
+
+static psxe_cd_result load_chime(psxe_engine *engine) {
+    psxe_cd_file file;
+    psxe_cd_result result = psxe_cd_init();
+    if (result == PSXE_CD_OK) {
+        result = psxe_cd_find("/ASSETS/CHIME.VAG", &file);
+    }
+    if (result == PSXE_CD_OK) {
+        result = psxe_audio_load_vag(&engine->audio, &chime, &file,
+                                     chime_staging, sizeof(chime_staging));
+    }
+    return result;
+}
+
+static int play_chime(psxe_engine *engine) {
+    return psxe_audio_play(&engine->audio, &chime, 0x2800, 0);
+}
+```
+
+For an embedded VAG, `psn00bsdk_target_incbin` supplies the data and length as
+separate symbols. The size symbol contains the byte count.
 
 ```c
 extern const uint8_t jump_vag[];
 extern const uint32_t jump_vag_size;
-static psxe_audio_sample jump_sfx;
 
-psxe_audio_upload_vag(&engine->audio, &jump_sfx, jump_vag, jump_vag_size);
-int voice = psxe_audio_play(&engine->audio, &jump_sfx, 0x3000, 0);
+static bool upload_jump(psxe_audio *audio, psxe_audio_sample *sample) {
+    return psxe_audio_upload_vag(audio, sample, jump_vag, jump_vag_size);
+}
 ```
 
 ## Memory card — `memory_card.h`
@@ -925,6 +1120,11 @@ typedef struct psxe_memory_card_config {
     const char *title;         /* shown by the BIOS manager, truncated to 63 chars */
     uint16_t format_version;   /* bump whenever the payload layout changes */
 } psxe_memory_card_config;
+
+typedef struct psxe_memory_card_file {
+    char name[21];
+    uint32_t size;
+} psxe_memory_card_file;
 ```
 
 Results: `PSXE_MEMORY_CARD_OK`, `PSXE_MEMORY_CARD_INVALID_ARGUMENT`,
@@ -934,7 +1134,9 @@ Results: `PSXE_MEMORY_CARD_OK`, `PSXE_MEMORY_CARD_INVALID_ARGUMENT`,
 and `PSXE_MEMORY_CARD_FULL`.
 
 The file name is `bu00:` (slot 0 = physical slot 1) or `bu10:` (slot 1)
-followed by `product_code` and `identifier`. Each identity is one 8192-byte
+followed by `product_code` and `identifier`. Both strings must be nonempty and
+their combined length is limited to 20 characters. The characters `*`, `/`,
+`?`, `:`, and `\` are rejected. Each identity is one 8192-byte
 file with a BIOS header, a static icon, and a 16-byte little-endian engine
 header at byte 512. Its fields are the four magic bytes `PXSE`, the 16-bit
 header version (`1`), the 16-bit game `format_version`, the 32-bit payload
@@ -950,49 +1152,166 @@ length, and the 32-bit CRC32 of the payload. Payload bytes start at byte 528.
 | `psxe_memory_card_result psxe_memory_card_delete(const psxe_memory_card_config *config, unsigned int slot)` | Deletes the save with the given identity. |
 | `const char *psxe_memory_card_result_string(psxe_memory_card_result result)` | Uppercase message suitable for `psxe_ui_text`. |
 
-Card calls block for a noticeable time. Call them only on a user action or a
-checkpoint, never every frame. The payload is copied as raw bytes: use
-fixed-width fields and bump `format_version` whenever its layout changes.
+Card calls block. Perform them on a user action or at a checkpoint and keep
+the result for rendering on subsequent frames. The engine stores your bytes
+as supplied. Use an explicit payload layout and increment `format_version`
+when it changes.
 
 ```c
-typedef struct save_v1 { int32_t level; int32_t score; } save_v1;
+#include <psxe/memory_card.h>
 
-save_v1 s = { 3, 12000 };
-psxe_memory_card_result r = psxe_memory_card_save(&engine->memory_card, 0, &s, sizeof(s));
-psxe_ui_text(&engine->renderer, 10, 220, psxe_memory_card_result_string(r));
+typedef struct checkpoint {
+    uint32_t level;
+    uint32_t score;
+} checkpoint;
+
+static psxe_memory_card_result save_checkpoint(const psxe_memory_card_config *config,
+                                                const checkpoint *current) {
+    return psxe_memory_card_save(config, 0, current, sizeof(*current));
+}
+
+static psxe_memory_card_result load_checkpoint(const psxe_memory_card_config *config,
+                                                checkpoint *current) {
+    checkpoint loaded;
+    size_t length = 0;
+    psxe_memory_card_result result = psxe_memory_card_load(config, 0, &loaded,
+                                                           sizeof(loaded), &length);
+    if (result != PSXE_MEMORY_CARD_OK) {
+        return result;
+    }
+    if (length != sizeof(loaded)) {
+        return PSXE_MEMORY_CARD_CORRUPT;
+    }
+    *current = loaded;
+    return PSXE_MEMORY_CARD_OK;
+}
+```
+
+Display `psxe_memory_card_result_string(result)` in your HUD. For a free-space
+indicator, query directory totals with a zero-capacity list.
+
+```c
+unsigned int free_blocks = 0;
+psxe_memory_card_result result = psxe_memory_card_list(0, NULL, 0, NULL, &free_blocks);
 ```
 
 ## Asset memory — `memory.h` and `vram.h`
 
-Use one caller-owned heap per asset lifetime and one managed VRAM pool per
-renderer. These operations are intended for initialization and level changes.
+Use a caller-owned heap for staging or storing level assets and one managed
+VRAM pool per renderer. Initialize them before loading. Keep heap operations,
+managed VRAM transfers, and resource teardown outside frame construction.
+
+| Type or constant | Meaning |
+| --- | --- |
+| `psxe_heap`, `psxe_heap_block` | Heap handle and opaque block metadata stored within the supplied RAM. |
+| `psxe_heap_stats` | `used_bytes`, `free_bytes`, and `largest_free` describe payload capacity, excluding headers. |
+| `psxe_mesh_storage` | Owns one allocation with the `mesh` view and writable `vertices`, `normals`, and `faces`. The mesh texture pointer is borrowed independently. |
+| `psxe_vram`, `psxe_vram_slot` | Renderer-bound pool and its internal allocations. The pool tracks occupied tiles and owns its slot views. |
+| `psxe_vram_id` | Slot `index` plus allocation `generation`. IDs are scoped to the pool lifetime. |
+| `psxe_vram_stats` | Counts `used_tiles` and `free_tiles` in units of 16 halfwords × 8 rows. |
+| `PSXE_VRAM_MAX_TEXTURES` | 32 managed texture slots per pool. |
+
+### Main RAM and mesh storage
 
 | Function | Behavior |
 | --- | --- |
-| `psxe_heap_init(&heap, memory, size)` | Initializes heap metadata inside caller-owned RAM. Reinitializing the heap invalidates its allocations. |
-| `psxe_heap_alloc(&heap, size)` | Returns an 8-byte-aligned block or `NULL`. Uses first-fit allocation. |
-| `psxe_heap_free(&heap, memory)` | Releases a live allocation from this heap and coalesces adjacent free blocks. Returns false for an invalid allocation. |
-| `psxe_heap_get_stats(&heap)` | Returns used, free, and largest contiguous free payload bytes. Header overhead is excluded. |
-| `psxe_mesh_alloc(&heap, vertices, normals, faces)` | Allocates a `psxe_mesh_storage` with writable arrays and the read-only mesh view used by scene entities or objects. Fill all referenced vertices, faces, and normals before drawing. A mesh can have zero normals. |
-| `psxe_mesh_free(&heap, storage)` | Releases the mesh and its arrays together after all instances detach it. |
-| `psxe_vram_init(&vram, &renderer)` | Reserves both framebuffers and the debug font. |
-| `psxe_vram_reserve(&vram, x, y, width, height)` | Reserves a fixed rectangle, rounded out to 16-halfword × 8-row tiles. Call before loading assets for fixed targets or manually placed textures. Coordinates use VRAM halfwords. |
-| `psxe_vram_load_tim(&vram, bytes, size, &id)` | Validates a sized, word-aligned 4/8/16-bit TIM, relocates it inside one texture page and uploads its pixels and optional CLUT. The TIM's source coordinates are ignored. A CLUT block may contain multiple rows of 16 or 256 colors. |
-| `psxe_vram_get(&vram, id)` | Returns a borrowed texture view or `NULL` for a stale ID. |
-| `psxe_vram_palette(&vram, id, row, &view)` | Copies a texture view using a zero-based CLUT row. Keeps the same uploaded texels. |
-| `psxe_vram_free(&vram, id)` | Synchronizes with submitted GPU work, invalidates the ID and recycles the texture and CLUT tiles. |
-| `psxe_vram_stats psxe_vram_get_stats(const psxe_vram *vram)` | Counts `used_tiles` and `free_tiles` in the 64 × 64 pool. Used tiles include buffers, the font, reservations, pixels, and CLUTs. Free tiles may be fragmented or cross texture-page boundaries. Returns zeros for a null or uninitialized pool. |
+| `bool psxe_heap_init(psxe_heap *heap, void *memory, size_t size)` | Initializes metadata inside the supplied byte span. Returns `false` if space is insufficient for aligned metadata and a minimal allocation. Reinitialization invalidates earlier allocations. |
+| `void *psxe_heap_alloc(psxe_heap *heap, size_t size)` | Returns an 8-byte-aligned block using first fit. Returns `NULL` on zero size, invalid input, or exhaustion. |
+| `bool psxe_heap_free(psxe_heap *heap, void *memory)` | Releases a live allocation from this heap and coalesces adjacent free blocks. Returns `false` for an invalid pointer or a double free. |
+| `psxe_heap_stats psxe_heap_get_stats(const psxe_heap *heap)` | Reports used, free, and largest contiguous free payload bytes. Read `largest_free` when sizing a single allocation. |
+| `psxe_mesh_storage *psxe_mesh_alloc(psxe_heap *heap, uint16_t vertex_count, uint16_t normal_count, uint16_t face_count)` | Allocates the mesh view and writable arrays together. Vertex and face counts must be positive. The normal count may be zero. Fill referenced entries before drawing. Returns `NULL` on invalid size or insufficient memory. |
+| `bool psxe_mesh_free(psxe_heap *heap, psxe_mesh_storage *storage)` | Releases the mesh and its arrays as a unit after every instance detaches. Returns `false` when the allocation is invalid. |
 
-Perform managed TIM uploads and frees outside frame builds, after detaching
-every mesh, material, and sprite that borrows the texture or a palette view.
-Source TIM bytes can be released after upload. A pool holds up to
-`PSXE_VRAM_MAX_TEXTURES` textures, subject to available page-compatible space.
-IDs belong to the lifetime of their pool. Discard them when reinitializing it.
-Set the raw-texture and unlit flags on a mesh whose texture contains baked
-shadows and highlights.
+Allocate from static game-owned storage between frames. This example creates
+one unlit triangle, exposes it through an object, and detaches the object before
+freeing the mesh. Call `build_triangle` with fresh state and call
+`psxe_object_draw` during `render` while the mesh is live.
 
 ```c
-psxe_texture evening;
+#include <psxe/psxe.h>
+
+static uint64_t triangle_arena[128];
+static psxe_heap triangle_heap;
+static psxe_mesh_storage *triangle_storage;
+static psxe_object triangle_object;
+
+static bool build_triangle(void) {
+    if (!psxe_heap_init(&triangle_heap, triangle_arena, sizeof(triangle_arena))) {
+        return false;
+    }
+    triangle_storage = psxe_mesh_alloc(&triangle_heap, 3, 0, 1);
+    if (triangle_storage == NULL) {
+        return false;
+    }
+    triangle_storage->vertices[0] = (SVECTOR){ -48, 48, 0, 0 };
+    triangle_storage->vertices[1] = (SVECTOR){ 0, -48, 0, 0 };
+    triangle_storage->vertices[2] = (SVECTOR){ 48, 48, 0, 0 };
+    triangle_storage->faces[0] = (psxe_face){
+        .vertex = { 0, 1, 2 }, .color = { 230, 120, 48 },
+        .flags = PSXE_MATERIAL_DOUBLE_SIDED
+    };
+    psxe_object_init(&triangle_object, &triangle_storage->mesh);
+    psxe_object_set_position(&triangle_object, 0, 0, 400);
+    return true;
+}
+
+static bool release_triangle(void) {
+    if (triangle_storage == NULL) {
+        return true;
+    }
+    psxe_object_set_mesh(&triangle_object, NULL);
+    if (!psxe_mesh_free(&triangle_heap, triangle_storage)) {
+        return false;
+    }
+    triangle_storage = NULL;
+    return true;
+}
+```
+
+### Managed texture storage
+
+| Function | Behavior |
+| --- | --- |
+| `void psxe_vram_init(psxe_vram *vram, const psxe_renderer *renderer)` | Clears the pool and reserves both framebuffers and the debug font. Pass an initialized renderer and initialize the pool before creating texture IDs. |
+| `bool psxe_vram_reserve(psxe_vram *vram, int x, int y, int width, int height)` | Reserves a rectangle until pool reinitialization. X and width use VRAM halfwords. Y and height use rows. Rectangles round outward to tiles, and overlap with an occupied tile fails. |
+| `bool psxe_vram_load_tim(psxe_vram *vram, const void *data, size_t size, psxe_vram_id *id)` | Validates a sized, word-aligned 4/8/16-bit TIM and writes an ID on success. Relocates pixels inside a texture page and allocates a CLUT as needed. Indexed CLUTs use rows of 16 or 256 colors. Source coordinates are ignored. |
+| `const psxe_texture *psxe_vram_get(const psxe_vram *vram, psxe_vram_id id)` | Returns a borrowed texture view or `NULL` for a stale or invalid ID. |
+| `bool psxe_vram_palette(const psxe_vram *vram, psxe_vram_id id, unsigned int palette, psxe_texture *view)` | Writes a texture view using a zero-based CLUT row and the same pixels. Returns `false` for invalid IDs or unavailable rows. |
+| `bool psxe_vram_free(psxe_vram *vram, psxe_vram_id id)` | Waits for submitted GPU work, invalidates the ID, and recycles the tiles. Returns `false` during frame construction, for an invalid ID, or when GPU synchronization fails. |
+| `psxe_vram_stats psxe_vram_get_stats(const psxe_vram *vram)` | Counts `used_tiles` and `free_tiles` in the 64 × 64 pool. Used tiles include buffers, the font, reservations, pixels, and CLUTs. Free tiles may be fragmented or cross texture-page boundaries. Returns zeros for a null or uninitialized pool. |
+
+Reserve fixed render targets and manually placed textures before managed
+uploads. This helper uses the heap for staging and releases the memory on
+either outcome. Call it with an initialized CD service, heap, and VRAM pool
+between frame builds. A successful ID remains valid after staging is released.
+
+```c
+#include <psxe/psxe.h>
+
+static bool load_disc_tim(psxe_heap *heap, psxe_vram *vram, const char *path,
+                          psxe_vram_id *id) {
+    psxe_cd_file file;
+    if (psxe_cd_find(path, &file) != PSXE_CD_OK) {
+        return false;
+    }
+    void *staging = psxe_heap_alloc(heap, file.size);
+    if (staging == NULL) {
+        return false;
+    }
+    bool loaded = psxe_cd_read_file(&file, 0, staging, file.size) == PSXE_CD_OK &&
+                  psxe_vram_load_tim(vram, staging, file.size, id);
+    psxe_heap_free(heap, staging);
+    return loaded;
+}
+```
+
+Every borrowed texture pointer and copied palette view depends on the
+allocation. Detach all borrowers before `psxe_vram_free`. If the free fails,
+keep the ID for a later retry. Give palette views persistent game-owned
+storage whenever a material retains a pointer to them.
+
+```c
+static psxe_texture evening;
 if (psxe_vram_palette(&vram, wall_texture, 1, &evening)) {
     /* Keep evening alive for as long as the material borrows it. */
     psxe_material_set_texture(&wall_material, &evening);
@@ -1003,9 +1322,10 @@ if (psxe_vram_palette(&vram, wall_texture, 1, &evening)) {
 
 ## Combining APIs: advanced recipes
 
-These recipes only use the functions above. They show patterns, not shipped
-engine features. Each one keeps to the engine rules: fixed capacity, no heap,
-bounded failure.
+The recipes show how to compose the public APIs in game callbacks. Names such
+as `my_game`, `item_mesh`, and `simulate_world` stand for game-owned types,
+assets, and routines. Snippets labeled `init`, `update`, or `render` belong in
+the corresponding callback.
 
 ### 1. Region-correct timers
 
@@ -1013,11 +1333,11 @@ bounded failure.
 build lasts as long in real time as an NTSC one.
 
 ```c
-static uint16_t seconds_to_frames(const psxe_engine *engine, uint16_t tenths) {
-    return (uint16_t)((engine->ticks_per_second * tenths) / 10u);
+static uint32_t tenths_to_frames(const psxe_engine *engine, uint16_t tenths) {
+    return ((uint32_t)engine->ticks_per_second * tenths) / 10u;
 }
 
-/* in init:   game->spawn_timer = seconds_to_frames(engine, 15);  -> 1.5 s */
+/* in init:   game->spawn_timer = tenths_to_frames(engine, 15);  -> 1.5 s */
 /* in update: if (game->spawn_timer > 0 && --game->spawn_timer == 0) { spawn(); } */
 
 /* Per-second speeds: move 300 units/s regardless of region. */
@@ -1047,24 +1367,24 @@ typedef struct shooter_game {
     psxe_audio_sample fire_sfx;
 } shooter_game;
 
-/* World X of roughly -160..160 -> SPU pan -0x1000..0x1000. Clamp in 32 bits
- * first: casting a large value to int16_t would wrap before the engine clamps. */
+/* World X of roughly -160..160 -> SPU pan -0x1000..0x1000. */
 static int16_t pan_from_x(int32_t x) {
-    int32_t pan = x * 25;
-    if (pan < -0x1000) { pan = -0x1000; }
-    if (pan > 0x1000)  { pan = 0x1000; }
-    return (int16_t)pan;
+    if (x <= -164) { return -0x1000; }
+    if (x >= 164)  { return 0x1000; }
+    return (int16_t)(x * 25);
 }
 
 static void fire(psxe_engine *engine, shooter_game *g) {
     const psxe_entity *ship = psxe_scene_get_const(&g->scene, g->ship);
-    unsigned int i;
+    if (ship == NULL) {
+        return;
+    }
 
-    for (i = 0; i < MAX_SHOTS; ++i) {
+    for (unsigned int i = 0; i < MAX_SHOTS; ++i) {
         if (!g->shots[i].used) {
             psxe_entity_id id = psxe_scene_create(&g->scene);
             psxe_entity *e = psxe_scene_get(&g->scene, id);
-            if (e == NULL || ship == NULL) {
+            if (e == NULL) {
                 return;                       /* scene full: drop the shot */
             }
             e->mesh = &shot_mesh;
@@ -1077,7 +1397,7 @@ static void fire(psxe_engine *engine, shooter_game *g) {
     }
 }
 
-static void update_shots(shooter_game *g) {
+static void update_shots(psxe_engine *engine, shooter_game *g) {
     unsigned int i;
     for (i = 0; i < MAX_SHOTS; ++i) {
         psxe_entity *e;
@@ -1090,22 +1410,23 @@ static void update_shots(shooter_game *g) {
             g->shots[i].used = false;
             continue;
         }
-        e->transform.position.vz += 20;
+        e->transform.position.vz += 1200 / (int32_t)engine->ticks_per_second;
     }
 }
 
 static void shooter_update(psxe_engine *engine, void *user_data) {
     shooter_game *g = user_data;
     const psxe_pad_state *pad = psxe_input_pad(&engine->input, 0);
+    update_shots(engine, g);
     if (psxe_button_pressed(pad, PAD_CROSS)) {
         fire(engine, g);
     }
-    update_shots(g);
 }
 ```
 
-`psxe_audio_play` also clamps `pan`, but only after the value has become an
-`int16_t`, so clamp wide values yourself as `pan_from_x` does.
+Clamp world coordinates before multiplying and narrowing to `int16_t`.
+`psxe_audio_play` receives the narrowed value. The shot moves 1200 units per
+second and lives for one second at either regional frame rate.
 
 ### 3. Analog orbit camera with digital fallback
 
@@ -1265,24 +1586,33 @@ typedef struct save_v2 { int32_t level; int32_t score; int32_t lives; uint8_t fl
 
 static psxe_memory_card_result load_any(const psxe_engine *engine, save_v2 *out) {
     size_t size = 0;
-    psxe_memory_card_result r = psxe_memory_card_load(&engine->memory_card, 0, out, sizeof(*out), &size);
+    save_v2 candidate;
+    psxe_memory_card_result r = psxe_memory_card_load(&engine->memory_card, 0,
+                                                      &candidate, sizeof(candidate), &size);
 
-    if (r == PSXE_MEMORY_CARD_OK && size != sizeof(*out)) {
-        return PSXE_MEMORY_CARD_CORRUPT;        /* right version, wrong size */
-    }
-    if (r == PSXE_MEMORY_CARD_VERSION_MISMATCH) {
-        psxe_memory_card_config old = engine->memory_card;
-        save_v1 v1;
-        old.format_version = 1;
-        r = psxe_memory_card_load(&old, 0, &v1, sizeof(v1), &size);
-        if (r == PSXE_MEMORY_CARD_OK && size == sizeof(v1)) {
-            memset(out, 0, sizeof(*out));
-            out->level = v1.level;
-            out->score = v1.score;
-            out->lives = 3;                     /* default for the new field */
+    if (r == PSXE_MEMORY_CARD_OK) {
+        if (size != sizeof(candidate)) {
+            return PSXE_MEMORY_CARD_CORRUPT;
         }
+        *out = candidate;
+        return PSXE_MEMORY_CARD_OK;
     }
-    return r;
+    if (r != PSXE_MEMORY_CARD_VERSION_MISMATCH) {
+        return r;
+    }
+
+    psxe_memory_card_config old = engine->memory_card;
+    save_v1 v1;
+    old.format_version = 1;
+    r = psxe_memory_card_load(&old, 0, &v1, sizeof(v1), &size);
+    if (r != PSXE_MEMORY_CARD_OK) {
+        return r;
+    }
+    if (size != sizeof(v1)) {
+        return PSXE_MEMORY_CARD_CORRUPT;
+    }
+    *out = (save_v2){ .level = v1.level, .score = v1.score, .lives = 3 };
+    return PSXE_MEMORY_CARD_OK;
 }
 
 /* main(): .memory_card.format_version = 2 */
@@ -1335,55 +1665,75 @@ psn00bsdk_target_incbin(my_game PRIVATE jump_vag  assets/jump.vag)
 ```c
 extern const uint32_t atlas_tim[];
 static psxe_texture atlas;
+static psxe_transform quad_transform;
+static const SVECTOR quad_vertices[] = {
+    { -64, -64, 0, 0 }, { 64, -64, 0, 0 },
+    { -64,  64, 0, 0 }, { 64,  64, 0, 0 }
+};
 
 /* UVs are offsets from the texture's base u/v (0..width-1, 0..height-1). */
 static const psxe_face quad_faces[] = {
     { { 0, 1, 2 }, 0, { { 0, 0 }, { 63, 0 }, { 0, 63 } },  { 128, 128, 128 },
-      PSXE_MATERIAL_TEXTURED | PSXE_MATERIAL_LIT },
+      PSXE_MATERIAL_TEXTURED | PSXE_MATERIAL_DOUBLE_SIDED },
     { { 1, 3, 2 }, 0, { { 63, 0 }, { 63, 63 }, { 0, 63 } }, { 128, 128, 128 },
-      PSXE_MATERIAL_TEXTURED | PSXE_MATERIAL_LIT }
+      PSXE_MATERIAL_TEXTURED | PSXE_MATERIAL_DOUBLE_SIDED }
 };
-static psxe_mesh quad;   /* not const: texture pointer is set at runtime */
+static const psxe_mesh quad = {
+    .vertices = quad_vertices, .faces = quad_faces,
+    .vertex_count = PSXE_ARRAY_COUNT(quad_vertices),
+    .face_count = PSXE_ARRAY_COUNT(quad_faces), .texture = &atlas
+};
 
 static void tex_init(psxe_engine *engine, void *user_data) {
-    if (psxe_texture_load_tim(&atlas, atlas_tim)) {
-        quad.texture = &atlas;   /* invalid/NULL texture -> faces fall back to flat color */
-    }
+    (void)engine;
+    (void)user_data;
+    quad_transform = psxe_transform_identity();
+    quad_transform.position.vz = 600;
+    psxe_texture_load_tim(&atlas, atlas_tim); /* an invalid texture gives flat color */
 }
 
 static void tex_render(psxe_engine *engine, void *user_data) {
+    (void)user_data;
     psxe_draw_mesh(&engine->renderer, &quad, &quad_transform);
     /* Same VRAM image reused as a HUD icon (top-left 32x32 texels). */
     psxe_draw_sprite(&engine->renderer, &atlas, 8, 8, 32, 32, (psxe_color){ 128, 128, 128 }, false);
 }
 ```
 
-Fill `quad`'s vertices, normals, and counts like `cube_mesh` in the sample.
-Author the TIM at a VRAM position that does not overlap the two framebuffers
-(`0,0` to `width,2*height`), the debug font at `(960, 0)`, or any render
-target. To show a different atlas cell, use a `psxe_sprite` with
-`psxe_sprite_set_region`; `psxe_draw_sprite` always starts at the base
-`u`/`v`.
+Author a TIM at least 64 × 64 texels in free VRAM, clear of the two
+framebuffers, the font at `(960, 0)`, and render targets. The same texture
+backs both the double-sided mesh and the HUD icon. Use
+`psxe_sprite_set_region` to choose a different atlas cell.
 
 ### 10. Driving the subsystems without `psxe_engine_run`
 
 For tools, tests, or a custom loop (for example several update ticks per
-rendered frame), call the same functions the engine uses, in the same order.
+rendered frame), call the same functions the engine uses in the same order.
+The two application helpers below populate the scene and step the simulation.
+Consume input edges only on the first simulation step.
 
 ```c
+extern void populate_scene(psxe_scene *scene);
+extern void simulate(psxe_scene *scene, const psxe_input *input, bool use_button_edges);
+
 int main(void) {
     static psxe_engine engine;
     static psxe_scene scene;
-    const psxe_engine_config config = { /* ... as above ... */ };
-    unsigned int step;
+    const psxe_engine_config config = {
+        .render = {
+            .width = 320, .height = 240, .video_mode = PSXE_VIDEO_NTSC,
+            .clear_color = { 20, 28, 48 }, .dither = true
+        }
+    };
 
     psxe_engine_init(&engine, &config);        /* still initializes every subsystem */
     psxe_scene_init(&scene);
+    populate_scene(&scene);
 
     for (;;) {
         psxe_input_poll(&engine.input);
-        for (step = 0; step < 2; ++step) {      /* two simulation steps per frame */
-            simulate(&scene, &engine.input);
+        for (unsigned int step = 0; step < 2; ++step) {
+            simulate(&scene, &engine.input, step == 0);
         }
         psxe_renderer_begin_frame(&engine.renderer);
         psxe_scene_render(&scene, &engine.renderer);
@@ -1399,26 +1749,28 @@ once per frame, not once per simulation step.
 
 ### 11. Damage flash and death fade with materials only
 
-Effects that need no extra assets and no GTE work: replace the color for a
-flash, then switch to additive blending and fade the tint toward black, which
-adds nothing to the framebuffer.
+Replace the face color for an opaque flash. For the death effect, use additive
+blending and fade the tint to black. Both effects use unlit, untextured faces.
+Store the ordinary material in `e->base_material` when initializing the enemy.
 
 ```c
-static void enemy_update(psxe_engine *engine, enemy *e) {
+static void enemy_update(enemy *e) {
     psxe_object *o = &e->object;
 
     if (e->hit_timer > 0) {
         --e->hit_timer;
         psxe_object_set_color(o, (psxe_color){ 255, 255, 255 }, PSXE_COLOR_REPLACE);
-        psxe_object_set_effects(o, PSXE_EFFECT_UNLIT, PSXE_BLEND_HALF);   /* cheaper, too */
+        psxe_object_set_effects(o, PSXE_EFFECT_UNLIT | PSXE_EFFECT_UNTEXTURED,
+                                PSXE_BLEND_HALF);
     } else if (e->dying > 0) {
-        uint8_t level = (uint8_t)(e->dying * 4);   /* dying counts 63 -> 0: 252 -> 0 */
+        uint8_t level = (uint8_t)(e->dying * 2);   /* start dying at 64 for a factor of 1.0 */
         --e->dying;
         psxe_object_set_color(o, (psxe_color){ level, level, level }, PSXE_COLOR_TINT);
-        psxe_object_set_effects(o, PSXE_EFFECT_SEMITRANSPARENT | PSXE_EFFECT_UNLIT, PSXE_BLEND_ADD);
+        psxe_object_set_effects(o, PSXE_EFFECT_SEMITRANSPARENT | PSXE_EFFECT_UNLIT |
+                                PSXE_EFFECT_UNTEXTURED, PSXE_BLEND_ADD);
         o->visible = (e->dying > 0);
     } else {
-        o->material = psxe_material_default();
+        o->material = e->base_material;
     }
 }
 ```
@@ -1448,10 +1800,9 @@ static void minimap_render(psxe_engine *engine, my_game *g) {
 }
 ```
 
-Make the minimap sprite smaller than the target to scale it down
-(`psxe_sprite_set_size`), or add `PSXE_EFFECT_SEMITRANSPARENT` with
-`PSXE_BLEND_HALF` for an overlay look (only untextured parts blend; see the
-STP note above).
+Use `psxe_sprite_set_size` to fit the map in a smaller HUD rectangle. A
+render-target texture uses opaque drawn pixels and transparent zero texels.
+For a blended surround, submit a semitransparent panel behind the sprite.
 
 ## Quick index
 
