@@ -79,6 +79,9 @@ automated emulator smoke tests pass, and capacity failures are observable.
 
 ## Milestone 2 — asset cooking and memory layout
 
+- [x] Cook a single textured GLB primitive into quantized topology, packed
+  vertex frames, and an 8/16-bpp TIM for embedding. Carrot Man includes a
+  source-specific idle and walk bake. [Sample](samples/carrot/README.md)
 - [ ] Add a manifest-driven `tools/psxe-cook` host executable with dependency
   tracking and stable content hashes.
 - [ ] Convert triangulated OBJ and glTF meshes into a versioned PSXE mesh format
@@ -159,8 +162,11 @@ loads without runtime parsing of source formats.
   sprite rotation, sprite animation, particles, trails, decals,
   sky/background layers, and render-target extensions (paletted/8-bit
   targets, double buffering, VRAM-allocator integration).
-- [ ] Add rigid-part and keyframed vertex animation first; evaluate limited
-  skinning only after profiling memory and GTE cost.
+- [x] Add keyframed mesh animation with fixed-point interpolation, looping
+  and one-shot playback, and caller-owned pose buffers. Exercise it in the
+  controller-driven Carrot Man sample.
+- [ ] Add runtime rigid-part tracks and evaluate limited skinning after
+  profiling memory and GTE cost.
 - [ ] Add LOD groups, portal/room visibility, occlusion hints, and offline
   ordering/subdivision tools for large environments.
 - [ ] Establish representative render benchmarks and budgets for NTSC/PAL,

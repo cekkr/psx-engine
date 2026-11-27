@@ -48,7 +48,7 @@ jobs:
       - name: Bootstrap PSX toolchain
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: ./thirds/setup_macos.sh
-      - name: Build and package debug cube
+      - name: Build and package debug samples
         run: ./build.sh debug
       - name: Check independent release builds
         run: tests/reproducible_disc.sh release

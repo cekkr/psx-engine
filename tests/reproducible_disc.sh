@@ -16,13 +16,15 @@ trap 'rm -rf "${build_dir}"' EXIT
 build_disc() {
     local build_path="$1"
     cmake --preset "${preset}" -S "${root}" -B "${build_path}"
-    cmake --build "${build_path}" --target psxe_cube_iso
+    cmake --build "${build_path}" --target psxe_cube_iso psxe_carrot_iso
 }
 
 TZ=UTC build_disc "${build_dir}/first"
 TZ=JST-9 build_disc "${build_dir}/second"
-for extension in exe bin cue; do
-    disc_file="samples/cube/psxe_cube.${extension}"
-    cmp "${build_dir}/first/${disc_file}" "${build_dir}/second/${disc_file}"
+for sample in cube carrot; do
+    for extension in exe bin cue; do
+        disc_file="samples/${sample}/psxe_${sample}.${extension}"
+        cmp "${build_dir}/first/${disc_file}" "${build_dir}/second/${disc_file}"
+    done
 done
-echo "Independent ${preset} builds produced identical PS-X EXE, BIN and CUE files."
+echo "Independent ${preset} builds produced identical cube and carrot PS-X EXE, BIN and CUE files."

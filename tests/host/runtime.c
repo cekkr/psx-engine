@@ -6,9 +6,76 @@
 #include "core/asset_formats.h"
 #include "core/fixed.h"
 #include "core/save_format.h"
+#include "psxe/animation.h"
 #include "psxe/memory.h"
 #include "psxe/scene.h"
 #include "render/render_internal.h"
+
+static void test_animation(void) {
+    static const SVECTOR frames[] = {
+        { INT16_MIN, -200, 80, 0 }, { 40, 40, 40, 0 },
+        { INT16_MAX, -60, -80, 0 }, { 20, 20, 20, 0 }
+    };
+    static const SVECTOR normal_frames[] = { { ONE, 0, 0, 0 }, { 0, ONE, 0, 0 } };
+    static const psxe_face face = { 0 };
+    const psxe_mesh mesh = {
+        .vertices = frames, .normals = normal_frames, .faces = &face,
+        .vertex_count = 2, .normal_count = 1, .face_count = 1
+    };
+    const psxe_anim_clip clip = {
+        .mesh = &mesh, .vertices = frames, .vertex_samples = PSXE_ARRAY_COUNT(frames),
+        .normals = normal_frames, .normal_samples = PSXE_ARRAY_COUNT(normal_frames),
+        .frame_count = 2, .frame_ms = 100
+    };
+    psxe_anim_player player = { 0 };
+    psxe_mesh pose = { 0 };
+    SVECTOR vertices[] = { { 777, 0, 0, 0 }, { 0 } };
+    SVECTOR normal[1];
+    psxe_anim_advance(&player, UINT32_MAX);
+    assert(!psxe_anim_finished(&player));
+    assert(!psxe_anim_sample(&player, &pose, vertices, 2, normal, 1));
+    assert(psxe_anim_play(&player, &clip, true));
+    psxe_anim_advance(&player, 50);
+    assert(!psxe_anim_sample(&player, &pose, vertices, 1, normal, 1));
+    assert(!psxe_anim_sample(&player, &pose, vertices, 2, normal, 0));
+    assert(pose.vertices == NULL && vertices[0].vx == 777);
+    assert(psxe_anim_sample(&player, &pose, vertices, 2, normal, 1));
+    assert(pose.faces == &face && pose.vertices == vertices && pose.normals == normal);
+    assert(vertices[0].vx == 0 && vertices[0].vy == -130 && vertices[0].vz == 0);
+    assert(vertices[1].vx == 30 && normal[0].vx == ONE / 2 && normal[0].vy == ONE / 2);
+    psxe_anim_seek(&player, 375);
+    assert(psxe_anim_sample(&player, &pose, vertices, 2, normal, 1));
+    assert(player.time_ms == 175 && vertices[0].vy == -165 && vertices[1].vx == 35);
+    psxe_anim_advance(&player, UINT32_MAX);
+    assert(player.time_ms == (175u + UINT32_MAX % 200u) % 200u);
+    assert(!psxe_anim_finished(&player));
+
+    psxe_anim_clip bad = clip;
+    bad.vertex_samples = 3;
+    assert(!psxe_anim_play(&player, &bad, false) && player.clip == &clip && player.loop);
+    bad = clip;
+    bad.normal_samples = 1;
+    assert(!psxe_anim_play(&player, &bad, false));
+    bad = clip;
+    bad.frame_ms = 0;
+    assert(!psxe_anim_play(&player, &bad, false));
+    assert(psxe_anim_play(&player, &clip, false) && !psxe_anim_finished(&player));
+    psxe_anim_advance(&player, UINT32_MAX);
+    assert(psxe_anim_finished(&player) && player.time_ms == 100);
+    assert(psxe_anim_sample(&player, &pose, vertices, 2, normal, 1) && vertices[0].vx == INT16_MAX);
+    psxe_anim_seek(&player, 0);
+    assert(!psxe_anim_finished(&player));
+
+    psxe_anim_clip still = clip;
+    still.frame_count = 1;
+    still.normals = NULL;
+    still.normal_samples = 0;
+    assert(psxe_anim_play(&player, &still, false) && psxe_anim_finished(&player));
+    assert(psxe_anim_play(&player, &still, true) && !psxe_anim_finished(&player));
+    psxe_anim_advance(&player, 50);
+    assert(psxe_anim_sample(&player, &pose, vertices, 2, NULL, 0));
+    assert(vertices[0].vx == INT16_MIN && pose.normals == mesh.normals);
+}
 
 static void test_scene(void) {
     psxe_scene scene;
@@ -216,6 +283,7 @@ static void test_vag(void) {
 }
 
 int main(void) {
+    test_animation();
     test_scene();
     test_heap();
     test_packets();
@@ -223,6 +291,6 @@ int main(void) {
     test_saves();
     test_tim();
     test_vag();
-    puts("PSXE host tests passed (scene, heap, packets, fixed-point, saves, TIM, VAG).");
+    puts("PSXE host tests passed (animation, scene, heap, packets, fixed-point, saves, TIM, VAG).");
     return 0;
 }

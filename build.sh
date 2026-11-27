@@ -16,3 +16,4 @@ cmake --preset "${preset}" -S "${repo_root}"
 cmake --build --preset "${preset}"
 
 echo "Disc image: ${repo_root}/build/${preset}/samples/cube/psxe_cube.cue"
+echo "Disc image: ${repo_root}/build/${preset}/samples/carrot/psxe_carrot.cue"

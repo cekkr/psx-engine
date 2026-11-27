@@ -20,6 +20,7 @@ Use the umbrella header or the individual header named in each section.
 - [Materials and effects](#materials-and-effects)
 - [Lights — `psxe_light`](#lights--psxe_light)
 - [Objects — `psxe_object`](#objects--psxe_object)
+- [Mesh animation — `animation.h`](#mesh-animation--animationh)
 - [Sprites — `psxe_sprite`](#sprites--psxe_sprite)
 - [Render to texture — `psxe_render_target`](#render-to-texture--psxe_render_target)
 - [Scene — `scene.h`](#scene--sceneh)
@@ -632,6 +633,59 @@ for (i = 0; i < 8; ++i) {
     psxe_object_draw(&engine->renderer, &crates[i]);
 }
 ```
+
+## Mesh animation — `animation.h`
+
+`psxe_anim_clip` borrows a `const psxe_mesh *mesh` that supplies shared
+faces, texture, and vertex and normal counts. Its `vertices` stream
+contains `frame_count` consecutive poses, each with `mesh->vertex_count`
+`SVECTOR`s in mesh order. Supply the stream length in `vertex_samples`.
+The optional `normals` stream uses the mesh's normal order and
+`mesh->normal_count` vectors per frame. Supply its length in `normal_samples`
+or use `NULL` and zero to borrow the original mesh normals. Each frame is
+separated by `frame_ms` milliseconds. Both timing fields are nonzero
+`uint16_t` values.
+
+Zero-initialize `psxe_anim_player` before use. Its `clip`, `time_ms`, and
+`loop` fields expose the current playback state. Keep the clip, source
+streams, and mesh alive and immutable for the duration of playback. The
+pose buffers must be writable and disjoint from each other, the output mesh
+view, and the clip data.
+
+| Function | Behavior |
+| --- | --- |
+| `bool psxe_anim_play(psxe_anim_player *player, const psxe_anim_clip *clip, bool loop)` | Checks frame timing and declared stream lengths and starts at the first pose. Failure preserves the player. |
+| `void psxe_anim_seek(psxe_anim_player *player, uint32_t time_ms)` | Sets absolute clip time in milliseconds. Loops wrap across the last-to-first interval. One-shots clamp at the last pose. |
+| `void psxe_anim_advance(psxe_anim_player *player, uint32_t elapsed_ms)` | Advances by elapsed milliseconds with the same wrap or clamp behavior. |
+| `bool psxe_anim_finished(const psxe_anim_player *player)` | True when a non-looping clip is at its last pose. A one-frame one-shot is finished at time zero. |
+| `bool psxe_anim_sample(const psxe_anim_player *player, psxe_mesh *mesh, SVECTOR *vertices, size_t vertex_capacity, SVECTOR *normals, size_t normal_capacity)` | Fills a drawable mesh view using the caller's buffers, with capacities in vectors. Pass `NULL, 0` for the normal buffer if there is no animated normal stream. Invalid input leaves the outputs untouched. |
+
+Sampling uses fixed-point linear interpolation on vertex and normal components.
+Use unit-length key normals with modest angular changes between frames, since
+interpolated normals are not renormalized. The mesh view borrows its faces,
+texture, and any static normals. It works with mesh draws, objects, and scene
+entities. Allocate one writable pose per instance and sample in `update` before
+rendering. To keep a clip's speed across PAL and NTSC, convert each video tick
+to elapsed milliseconds and carry the fraction into the next update.
+
+```c
+enum { VERTEX_COUNT = 337 }; /* Match the clip's mesh. */
+static psxe_anim_player player;
+static psxe_mesh pose;
+static SVECTOR vertices[VERTEX_COUNT];
+static uint32_t remainder;
+
+/* Call psxe_anim_play(&player, &walk, true) during initialization. */
+static void animate(psxe_engine *engine) {
+    remainder += 1000u;
+    psxe_anim_advance(&player, remainder / engine->ticks_per_second);
+    remainder %= engine->ticks_per_second;
+    psxe_anim_sample(&player, &pose, vertices, PSXE_ARRAY_COUNT(vertices), NULL, 0);
+}
+```
+
+See the idle/walk clip setup and object draw in the
+[Carrot Man sample](samples/carrot/main.c).
 
 ## Sprites — `psxe_sprite`
 
@@ -1810,6 +1864,7 @@ For a blended surround, submit a semitransparent panel behind the sprite.
 | --- | --- |
 | `types.h` | `psxe_transform_identity` |
 | `engine.h` | `psxe_engine_init`, `psxe_engine_run`, `psxe_engine_stop` |
+| `animation.h` | `psxe_anim_play`, `psxe_anim_seek`, `psxe_anim_advance`, `psxe_anim_finished`, `psxe_anim_sample` |
 | `render.h` (core) | `psxe_renderer_init`, `psxe_renderer_begin_frame`, `psxe_renderer_end_frame`, `psxe_renderer_set_camera`, `psxe_renderer_set_directional_light`, `psxe_texture_load_tim`, `psxe_draw_mesh`, `psxe_draw_mesh_material`, `psxe_draw_mesh_lights`, `psxe_draw_sprite`, `psxe_ui_panel`, `psxe_ui_text` |
 | `render.h` (materials) | `psxe_material_default`, `psxe_material_set_texture`, `psxe_material_set_color`, `psxe_material_set_effects`, `psxe_material_set_light_exclude` |
 | `render.h` (lights) | `psxe_light_init`, `psxe_light_set_color`, `psxe_light_set_direction`, `psxe_light_set_position`, `psxe_light_set_range`, `psxe_light_set_layers`, `psxe_light_set_enabled`, `psxe_renderer_clear_lights`, `psxe_renderer_add_light`, `psxe_renderer_set_lights`, `psxe_renderer_light`, `psxe_renderer_set_ambient`, `psxe_draw_light_marker` |
@@ -1826,5 +1881,5 @@ For a blended surround, submit a semitransparent panel behind the sprite.
 
 Not available yet (see [`ROADMAP.md`](ROADMAP.md)): near-plane clipping,
 Gouraud shading and per-vertex lighting, light-radius debug draw, fog, sprite rotation, double-buffered or paletted render
-targets, animation, collision, SPU reclamation and voice completion tracking,
+targets, skeletal animation, collision, SPU reclamation and voice completion tracking,
 asynchronous card operations, and multitap.

@@ -27,6 +27,6 @@ cd "${root}"
     -g -O1 -ffunction-sections -fdata-sections "${strip_unused}" \
     ${sanitizers[@]+"${sanitizers[@]}"} \
     -I src/include -I src -idirafter "${sdk_include}" \
-    tests/host/runtime.c src/core/{asset_formats,fixed,memory,save_format,scene}.c \
+    tests/host/runtime.c src/core/{animation,asset_formats,fixed,memory,save_format,scene}.c \
     src/render/{object,packet}.c -o "${build_dir}/runtime"
 "${build_dir}/runtime"

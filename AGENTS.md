@@ -72,7 +72,7 @@ runtime code around convenient desktop parsers.
 ### Current and planned behavior stay separate
 
 Only compiled and proportionally tested behavior is present or experimental.
-World streaming, animation, collision, fog, asset cooking, asynchronous saves, and
+World streaming, skeletal animation, collision, fog, general asset cooking, asynchronous saves, and
 platform bootstrap beyond macOS remain planned until their code and validation
 land.
 
@@ -156,6 +156,10 @@ silently simulate faster/slower without an explicit game policy.
   pixels and palettes. Reserve fixed targets and legacy TIM regions before
   managed uploads. Detach borrowed views before release and wait for GPU work
   before recycling VRAM. Managed transfers happen between frame builds.
+- **Animated poses:** [`src/core/animation.c`](src/core/animation.c) samples
+  equally spaced baked vertex and optional normal frames into disjoint
+  caller-owned buffers. The output view borrows mesh topology and texture.
+  Keep clip data immutable, and advance in milliseconds using the video rate.
 - **SPU DMA and memory:** uploads begin after `0x1010`, are rounded/aligned to 64
   bytes, and must remain below `0x80000`. `psxe_audio_upload_vag` must validate
   big-endian header lengths before DMA. Playback may steal the next round-robin
@@ -316,6 +320,16 @@ caller output. Host tests lock down the serialized bytes and corruption paths.
 `psxe_tim_parse` and `psxe_vag_parse` validate the same sized inputs consumed by
 the managed VRAM and SPU upload paths. Their views borrow the input buffer.
 They execute on the host without DMA or hardware register access.
+
+### [`src/include/psxe/animation.h`](src/include/psxe/animation.h) and [`src/core/animation.c`](src/core/animation.c)
+
+`psxe_anim_clip` borrows a mesh and frame-major vertex and optional normal
+streams. `psxe_anim_play` validates frame sizes and starts playback.
+`psxe_anim_seek` and `psxe_anim_advance` wrap loops and clamp one-shots.
+`psxe_anim_finished` reports the last pose for one-shots.
+`psxe_anim_sample` uses fixed-point interpolation and writes a drawable mesh
+view with independent pose buffers. Host tests exercise wrap and clamp,
+stream and buffer capacities, and signed interpolation.
 
 ### [`src/include/psxe/cd.h`](src/include/psxe/cd.h) and [`src/platform/cd.c`](src/platform/cd.c)
 
@@ -515,6 +529,23 @@ Defines volume identifiers, fixed timestamps, boot files, documentation, and
 padding for `mkpsxiso`. File paths refer to `disc/` in the sample build directory.
 Keep disc entry names uppercase 8.3.
 
+### [`samples/carrot/`](samples/carrot/)
+
+Builds `psxe_carrot` and packages it with the model credits into a BIN/CUE.
+The port 1 D-pad or left stick moves and turns Carrot Man on a bounded floor.
+`main.c` uses the animation player and a managed TIM; `bake.py` authors
+idle/walk poses and calls the host cooker. The checked-in asset fixtures are
+the baked topology, positions, and indexed TIM. Keep their attribution when
+redistributing the demo. [Sample workflow](samples/carrot/README.md)
+
+### [`tools/cook_glb.py`](tools/cook_glb.py)
+
+Cooks one static textured GLB primitive into PSXE face initializers,
+little-endian `SVECTOR` positions, and an 8/16-bpp TIM. It runs on the host
+and calls FFmpeg to decode the image. Rotation, quantization, and baked pose
+generation happen offline, and the executable embeds the cooked vectors and
+texels with the SDK's `incbin` helper.
+
 ### [`tests/`](tests/)
 
 `host/run.sh` uses a native C compiler with the pinned SDK headers to test CPU
@@ -589,8 +620,17 @@ tools, sample inputs from elsewhere, or future third-party assets.
 - **Behavior:** colored/textured flat triangles, optional per-face lighting,
   ordering-table depth, affine GPU texturing, dithering, sprites, panels, text.
 - **Flow:** game/scene → `psxe_draw_mesh`/2D calls → packet arena → OT → GPU.
-- **Gap:** no near clipping, subdivision, Gouraud, depth cue/fog, animation,
-  frustum/mesh culling, VRAM allocator, or cooked-asset sample.
+- **Gap:** no near clipping, subdivision, Gouraud, depth cue/fog, or production
+  frustum/mesh culling.
+
+### Baked mesh animation — Experimental/scaffold
+
+- **Behavior:** loop or one-shot playback of evenly spaced poses with
+  optional animated normals and fixed-point interpolation.
+- **Flow:** cooked positions → animation player → caller-owned pose buffer
+  → mesh view → ordinary object or scene drawing.
+- **Gap:** rigid-part tracks, skeletal skinning, and character animation
+  profiling on physical hardware.
 
 ### Materials, objects, and sprite structs — Experimental/scaffold
 
@@ -701,6 +741,8 @@ tools, sample inputs from elsewhere, or future third-party assets.
   [`src/render/target.c`](src/render/target.c).
 - Scene handles/render iteration: `psxe_scene_*` →
   [`src/core/scene.c`](src/core/scene.c).
+- Baked mesh playback and sampling: `psxe_anim_*` →
+  [`src/core/animation.c`](src/core/animation.c).
 - Controller snapshots: `psxe_input_*`, `psxe_button_*` →
   [`src/platform/input.c`](src/platform/input.c).
 - CD data, drive, and audio transport: `psxe_cd_*` →
@@ -715,7 +757,8 @@ tools, sample inputs from elsewhere, or future third-party assets.
 - Build/package commands: presets → [`CMakePresets.json`](CMakePresets.json),
   wrappers → [`build.sh`](build.sh), [`run.sh`](run.sh).
 - Sample disc registry: [`samples/cube/CMakeLists.txt`](samples/cube/CMakeLists.txt)
-  and [`samples/cube/iso.xml`](samples/cube/iso.xml).
+  and [`samples/carrot/CMakeLists.txt`](samples/carrot/CMakeLists.txt), each
+  with its own ISO manifest.
 
 ## Build, Run, Test, Debug, and Release Checklist
 
@@ -742,7 +785,7 @@ cmake --preset debug
 cmake --build --preset debug
 ```
 
-The cube sample is the target integration build. A release claim additionally
+The cube and Carrot Man samples are target integration builds. A release claim additionally
 requires boot/input/audio/save/render checks in accurate emulators and on
 original hardware. Serial smoke, emulator screenshots, and physical-media
 validation remain open.
@@ -750,12 +793,14 @@ validation remain open.
 ## Test Ownership Map
 
 - Engine/source ABI and all module link dependencies → full `./build.sh debug`.
-- Disc manifest/boot-name consistency → `psxe_cube_iso` output from the same
+- Disc manifest/boot-name consistency → `psxe_cube_iso` and `psxe_carrot_iso` outputs from the same
   command, then emulator boot (manual).
 - 3D/light objects/scene lights/UI, materials/effects, objects, sprites, render targets, and
   input/save integration → [`samples/cube/main.c`](samples/cube/main.c)
   (manual runtime and DuckStation smoke checks).
 - Script syntax → run `bash -n` on each script, as in the GitHub Actions host job.
+- Animation interpolation and clip bounds → host tests. Cooked mesh, TIM,
+  and movement integration → Carrot Man disc in DuckStation.
 - Dependency installation → `./thirds/setup_macos.sh --check`.
 - Disc data/audio, mesh and texture lifetime → DuckStation checks with the
   cube disc plus temporary smoke executables. A separate mixed-mode disc
@@ -803,14 +848,15 @@ validation remain open.
 - Engine static library, callback loop, scene pool, 3D/2D renderer, light
   objects and scene lights, materials with baked textures, render-to-texture,
   controller input and rumble, ISO/sector/drive access, CD and resident VAG
-  audio, one-block saves, bounded RAM/VRAM allocation, and cube EXE and BIN/CUE.
+  audio, one-block saves, bounded RAM/VRAM allocation, baked mesh animation,
+  and cube and Carrot Man EXEs and BIN/CUEs.
 
 ### Known Gaps
 
 - Hosted CI verification, an emulator smoke harness, profiling, and
   original-hardware validation are open.
-- Renderer lacks clipping, subdivision, production culling, animation, fog,
-  Gouraud shading, and asset cooking.
+- Renderer lacks clipping, subdivision, production culling, skeletal animation,
+  fog, and Gouraud shading. A general-purpose asset cooker is still planned.
 - SPU reclamation, mixed audio/data scheduling, and asynchronous card I/O are open.
 - Linux/Windows bootstraps and safe physical-media workflow are not implemented.
 

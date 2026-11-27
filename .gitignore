@@ -31,6 +31,8 @@
 *.str
 !/samples/cube/assets/painted.tim
 !/samples/cube/assets/chime.vag
+!/samples/carrot/assets/color.tim
+!/samples/carrot/assets/poses.bin
 
 # Host/editor noise
 .DS_Store

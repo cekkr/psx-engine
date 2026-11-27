@@ -23,6 +23,8 @@ needed to grow complete games without hiding the console's constraints:
   hand-painted and indexed textures;
 - `psxe_object` mesh instances and `psxe_sprite` rectangles with atlas
   regions, scaling, flipping, and layers;
+- baked mesh animation with fixed-point interpolation and caller-owned pose
+  buffers;
 - render-to-texture passes into offscreen VRAM, sampled as textures in the
   same frame;
 - 2D sprites, translucent panels, and debug-font UI in the same display list;
@@ -35,10 +37,10 @@ needed to grow complete games without hiding the console's constraints:
   single-drive XA/CD-DA playback;
 - bounded caller-owned RAM and mesh allocation, plus relocatable TIM textures
   and CLUTs with explicit VRAM release;
-- a self-contained cube sample packaged as an emulator- and CD-ready BIN/CUE.
+- independently packaged cube and Carrot Man samples.
 
-The APIs and save format are pre-release. World streaming, asset cooking, animation,
-collision, richer UI, and hardware validation are
+The APIs and save format are pre-release. World streaming, a general-purpose
+asset pipeline, skeletal animation, collision, richer UI, and hardware validation are
 tracked as future work in [`ROADMAP.md`](ROADMAP.md).
 
 ## Quick start on macOS
@@ -64,9 +66,12 @@ Build configurations are selected by the first argument:
 ./build.sh release
 ```
 
-The sample disc is written to
-`build/<preset>/samples/cube/psxe_cube.cue` plus its matching `.bin` data track.
-To launch it with [PCSX-Redux](https://github.com/grumpycoders/pcsx-redux):
+The build writes two sample discs, each with a matching `.bin` data track.
+
+- Cube at `build/<preset>/samples/cube/psxe_cube.cue`
+- Carrot Man at `build/<preset>/samples/carrot/psxe_carrot.cue`
+
+To launch the cube with [PCSX-Redux](https://github.com/grumpycoders/pcsx-redux):
 
 ```sh
 ./run.sh debug
@@ -84,15 +89,15 @@ python3 tests/check_markdown_links.py
 tests/reproducible_disc.sh release
 ```
 
-The host suite exercises scene handles and light slots, heap and packet
-capacity, fixed-point math, the memory-card format, and managed TIM and VAG
+The host suite exercises animation playback, scene handles and light slots,
+heap and packet capacity, fixed-point math, the memory-card format, and managed TIM and VAG
 validation. It uses a native C compiler and the pinned PSn00bSDK headers. Set
 `PSXE_SDK_INCLUDE` to the SDK checkout's `libpsn00b/include` directory to run it
 without a target toolchain. The Markdown link check uses Python 3.9 or newer.
 
 The disc check builds in two fresh directories with different time zones and
-compares the PS-X EXE, BIN and CUE byte for byte. For repeatable packaging, the
-sample stages its disc files with a fixed UTC timestamp. GitHub Actions runs
+compares both samples' PS-X EXEs, BINs and CUEs byte for byte. The samples stage
+their disc files with a fixed UTC timestamp. GitHub Actions runs
 the host checks on Linux and the target builds on Apple Silicon macOS.
 
 ## Cube sample
@@ -124,6 +129,14 @@ to the BIOS TTY once per video second. Enable BIOS TTY logging in DuckStation
 to see CPU and GPU-wait ticks, packet use and drops, rejected faces, CD sectors,
 VRAM tiles, and resident SPU bytes. A timing value of `65535` marks the timer
 limit of about 15.48 ms. The release sample uses the compact frame and light HUD.
+
+## Carrot Man sample
+
+Open the Carrot Man CUE in an emulator and use the port 1 D-pad or left analog
+stick. The character faces the direction of travel, loops its walk while
+moving, and idles when you release the controller. The build uses the supplied
+model's cooked mesh and TIM. Python and FFmpeg are needed to regenerate those
+assets. [Sample instructions and asset credits](samples/carrot/README.md)
 
 ## Programming model
 
@@ -161,6 +174,7 @@ lifetimes, disc addressing, and drive ownership. [API reference](APIs.md)
 
 - [`src/`](src/) contains the engine public headers and implementation.
 - [`samples/`](samples/) contains independently packaged sample games.
+- [`tools/`](tools/) contains the host GLB-to-mesh-and-TIM cooker.
 - [`thirds/`](thirds/) contains the reproducible dependency bootstrap and owns
   all generated target libraries, SDK tools, and compiler files.
 - [`tests/`](tests/) contains host tests and disc reproducibility checks.

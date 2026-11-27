@@ -1,6 +1,7 @@
 #ifndef PSXE_PSXE_H
 #define PSXE_PSXE_H
 
+#include "psxe/animation.h"
 #include "psxe/audio.h"
 #include "psxe/cd.h"
 #include "psxe/config.h"

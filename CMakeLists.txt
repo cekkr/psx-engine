@@ -10,6 +10,7 @@ project(
 option(PSXE_BUILD_SAMPLES "Build bundled sample games" ON)
 
 set(PSXE_SOURCES
+    src/core/animation.c
     src/core/asset_formats.c
     src/core/engine.c
     src/core/fixed.c
@@ -47,4 +48,5 @@ target_link_libraries(psxe PUBLIC ${PSN00BSDK_LIBRARIES})
 
 if(PSXE_BUILD_SAMPLES)
     add_subdirectory(samples/cube)
+    add_subdirectory(samples/carrot)
 endif()
