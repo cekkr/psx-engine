@@ -6,9 +6,9 @@
 #include <psxapi.h>
 #include <psxetc.h>
 
+#include "../core/asset_formats.h"
+
 enum {
-    PSXE_VRAM_WIDTH = 1024,
-    PSXE_VRAM_HEIGHT = 512,
     PSXE_VRAM_TILE_W = 16,
     PSXE_VRAM_TILE_H = 8
 };
@@ -95,29 +95,6 @@ static bool psxe_vram_find(const psxe_vram *vram, RECT *area, unsigned int texel
     return false;
 }
 
-static uint32_t psxe_tim_le32(const uint8_t *data) {
-    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
-}
-
-static size_t psxe_tim_block(const uint8_t *data, size_t length, RECT *area) {
-    uint32_t block_size;
-    unsigned int width;
-    unsigned int height;
-    if ((length < 12u) || ((uintptr_t)data & 3u)) {
-        return 0;
-    }
-    block_size = psxe_tim_le32(data);
-    width = (unsigned int)data[8] | ((unsigned int)data[9] << 8);
-    height = (unsigned int)data[10] | ((unsigned int)data[11] << 8);
-    if ((block_size < 12u) || (block_size > length) || !width || !height ||
-        (width > PSXE_VRAM_WIDTH) || (height > PSXE_VRAM_HEIGHT) ||
-        (width * height > (block_size - 12u) / 2u)) {
-        return 0;
-    }
-    *area = (RECT){ 0, 0, (int16_t)width, (int16_t)height };
-    return block_size;
-}
-
 static bool psxe_vram_wait_upload(void) {
     int restore_interrupts;
     if (DrawSync(0) == 0) {
@@ -164,51 +141,29 @@ static bool psxe_vram_can_edit(const psxe_vram *vram) {
 }
 
 bool psxe_vram_load_tim(psxe_vram *vram, const void *data, size_t size, psxe_vram_id *id) {
-    const uint8_t *bytes = data;
-    const uint32_t *palette_data = NULL;
-    unsigned int mode;
-    unsigned int texels_per_word;
+    psxe_tim_view tim;
     unsigned int index;
     psxe_vram_slot allocation = { 0 };
 
-    if (!psxe_vram_can_edit(vram) || (data == NULL) || (id == NULL) || (size < 8u) ||
-        ((uintptr_t)data & 3u) || (psxe_tim_le32(bytes) != 0x10u)) {
+    if (!psxe_vram_can_edit(vram) || (id == NULL) || !psxe_tim_parse(data, size, &tim)) {
         return false;
     }
-    uint32_t flags = psxe_tim_le32(bytes + 4);
-    bytes += 8;
-    size -= 8;
-    mode = flags & 3u;
-    if ((flags != 2u) && (flags != 8u) && (flags != 9u)) {
-        return false;
-    }
-    texels_per_word = 4u >> mode;
-    if (flags & 8u) {
-        size_t block_size = psxe_tim_block(bytes, size, &allocation.palettes);
-        if (!block_size || allocation.palettes.w != (mode ? 256 : 16)) {
-            return false;
-        }
-        allocation.palette_count = (uint16_t)allocation.palettes.h;
-        palette_data = (const uint32_t *)(bytes + 12);
-        bytes += block_size;
-        size -= block_size;
-    }
-    if (!psxe_tim_block(bytes, size, &allocation.pixels) ||
-        ((unsigned int)allocation.pixels.w * texels_per_word > 256u) || (allocation.pixels.h > 256)) {
-        return false;
-    }
+    allocation.pixels = (RECT){ 0, 0, (int16_t)tim.pixels.width, (int16_t)tim.pixels.height };
+    allocation.palettes = (RECT){ 0, 0, (int16_t)tim.palettes.width, (int16_t)tim.palettes.height };
+    allocation.palette_count = tim.palettes.height;
+
     for (index = 0; index < PSXE_VRAM_MAX_TEXTURES; ++index) {
         if (!vram->slots[index].texture.valid) {
             break;
         }
     }
     if ((index == PSXE_VRAM_MAX_TEXTURES) || (DrawSync(0) != 0) ||
-        !psxe_vram_find(vram, &allocation.pixels, texels_per_word)) {
+        !psxe_vram_find(vram, &allocation.pixels, tim.texels_per_word)) {
         return false;
     }
 
     psxe_vram_mark(vram, &allocation.pixels, true);
-    if (palette_data != NULL) {
+    if (tim.palettes.data != NULL) {
         if (!psxe_vram_find(vram, &allocation.palettes, 0)) {
             psxe_vram_mark(vram, &allocation.pixels, false);
             return false;
@@ -216,19 +171,19 @@ bool psxe_vram_load_tim(psxe_vram *vram, const void *data, size_t size, psxe_vra
         psxe_vram_mark(vram, &allocation.palettes, true);
         allocation.texture.clut = (uint16_t)getClut(allocation.palettes.x, allocation.palettes.y);
     }
-    if ((palette_data != NULL && !psxe_vram_upload(allocation.palettes, palette_data)) ||
-        !psxe_vram_upload(allocation.pixels, (const uint32_t *)(bytes + 12))) {
+    if ((tim.palettes.data != NULL && !psxe_vram_upload(allocation.palettes, tim.palettes.data)) ||
+        !psxe_vram_upload(allocation.pixels, tim.pixels.data)) {
         psxe_vram_mark(vram, &allocation.pixels, false);
-        if (palette_data != NULL) {
+        if (tim.palettes.data != NULL) {
             psxe_vram_mark(vram, &allocation.palettes, false);
         }
         return false;
     }
 
-    allocation.texture.tpage = (uint16_t)getTPage(mode, 0, allocation.pixels.x, allocation.pixels.y);
-    allocation.texture.width = (uint16_t)((unsigned int)allocation.pixels.w * texels_per_word);
+    allocation.texture.tpage = (uint16_t)getTPage(tim.mode, 0, allocation.pixels.x, allocation.pixels.y);
+    allocation.texture.width = (uint16_t)((unsigned int)allocation.pixels.w * tim.texels_per_word);
     allocation.texture.height = (uint16_t)allocation.pixels.h;
-    allocation.texture.u = (uint8_t)((unsigned int)(allocation.pixels.x & 63) * texels_per_word);
+    allocation.texture.u = (uint8_t)((unsigned int)(allocation.pixels.x & 63) * tim.texels_per_word);
     allocation.texture.v = (uint8_t)(allocation.pixels.y & 255);
     allocation.texture.valid = true;
     allocation.generation = vram->slots[index].generation + 1u;

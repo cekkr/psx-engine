@@ -48,10 +48,12 @@ behavior.
   with status, directory/free-block queries, and deletion.
 - [ ] Run emulator regression captures and original-hardware tests for every
   shipped-looking feature above; until then this milestone remains experimental.
+  DuckStation debug smoke covered disc boot, TIM/VAG loading, SPU voice
+  start, both card slots, and two render-target passes at frame 120.
 
 ## Milestone 1 — correctness, diagnostics, and portability
 
-- [ ] Add host-unit-testable modules for handle generations, CRC/save headers,
+- [x] Add host-unit-testable modules for handle generations, CRC/save headers,
   fixed-point utilities, asset parsers, and capacity failure paths.
 - [ ] Add a PCSX-Redux smoke harness that boots the sample, waits a bounded
   number of frames, captures serial output/framebuffer, and fails on engine
@@ -61,8 +63,10 @@ behavior.
   SPU allocation.
 - [ ] Define debug assertions, panic screen, symbol-map workflow, and release
   logging policy.
-- [ ] Add CI for target compilation, BIN/CUE creation, Markdown links, script
-  syntax, and deterministic rebuild checks.
+- [x] Add host and target checks for compilation, BIN/CUE creation, Markdown
+  links, script syntax, and byte-for-byte rebuilds. GitHub Actions workflow added.
+- [ ] Confirm the hosted workflow on a clean runner, including cold bootstrap
+  and toolchain cache restore.
 - [ ] Implement `thirds/setup_linux.sh` for Debian/Ubuntu first, then package
   mappings for Fedora and Arch.
 - [ ] Implement Windows bootstrap through native MSYS2 or a documented WSL2

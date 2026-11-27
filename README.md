@@ -75,6 +75,26 @@ To launch it with [PCSX-Redux](https://github.com/grumpycoders/pcsx-redux):
 `run.sh` finds `pcsx-redux` on `PATH` or in `/Applications`, or accepts an
 explicit executable through `PCSX_REDUX`.
 
+## Development checks
+
+```sh
+tests/host/run.sh
+PSXE_SANITIZE=1 tests/host/run.sh
+python3 tests/check_markdown_links.py
+tests/reproducible_disc.sh release
+```
+
+The host suite exercises scene handles and light slots, heap and packet
+capacity, fixed-point math, the memory-card format, and managed TIM and VAG
+validation. It uses a native C compiler and the pinned PSn00bSDK headers. Set
+`PSXE_SDK_INCLUDE` to the SDK checkout's `libpsn00b/include` directory to run it
+without a target toolchain. The Markdown link check uses Python 3.9 or newer.
+
+The disc check builds in two fresh directories with different time zones and
+compares the PS-X EXE, BIN and CUE byte for byte. For repeatable packaging, the
+sample stages its disc files with a fixed UTC timestamp. GitHub Actions runs
+the host checks on Linux and the target builds on Apple Silicon macOS.
+
 ## Cube sample
 
 [`samples/cube/main.c`](samples/cube/main.c) is both a starting project and an
@@ -135,6 +155,7 @@ lifetimes, disc addressing, and drive ownership. [API reference](APIs.md)
 - [`samples/`](samples/) contains independently packaged sample games.
 - [`thirds/`](thirds/) contains the reproducible dependency bootstrap and owns
   all generated target libraries, SDK tools, and compiler files.
+- [`tests/`](tests/) contains host tests and disc reproducibility checks.
 - [`ROADMAP.md`](ROADMAP.md) separates current scaffolding from the work needed
   for production-sized games.
 - [`APIs.md`](APIs.md) lists every public function with snippets and recipes

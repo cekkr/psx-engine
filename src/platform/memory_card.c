@@ -8,36 +8,11 @@
 #include <psxapi.h>
 #include <sys/fcntl.h>
 
-#define PSXE_SAVE_DATA_OFFSET 512u
-#define PSXE_SAVE_MAGIC 0x45535850u /* "PXSE" in little-endian byte order. */
-#define PSXE_SAVE_HEADER_VERSION 1u
-
-typedef struct psxe_save_header {
-    uint32_t magic;
-    uint16_t header_version;
-    uint16_t format_version;
-    uint32_t payload_size;
-    uint32_t payload_crc;
-} psxe_save_header;
+#include "../core/save_format.h"
 
 static uint8_t psxe_card_buffer[PSXE_MEMORY_CARD_BLOCK_SIZE] __attribute__((aligned(4)));
 
 static const char *const psxe_card_devices[] = { "bu00:", "bu10:" };
-
-static uint32_t psxe_crc32(const uint8_t *data, size_t size) {
-    uint32_t crc = 0xffffffffu;
-    size_t index;
-    unsigned int bit;
-
-    for (index = 0; index < size; ++index) {
-        crc ^= data[index];
-        for (bit = 0; bit < 8; ++bit) {
-            uint32_t mask = (uint32_t)-(int32_t)(crc & 1u);
-            crc = (crc >> 1) ^ (0xedb88320u & mask);
-        }
-    }
-    return ~crc;
-}
 
 static bool psxe_make_filename(
     char *output,
@@ -206,25 +181,20 @@ psxe_memory_card_result psxe_memory_card_save(
     const void *payload,
     size_t payload_size
 ) {
-    psxe_save_header *header;
     char filename[32];
     int descriptor;
     int written;
 
-    if ((payload == NULL) || (payload_size == 0) || (payload_size > PSXE_MAX_SAVE_PAYLOAD) ||
-        !psxe_make_filename(filename, sizeof(filename), config, slot)) {
+    if (!psxe_make_filename(filename, sizeof(filename), config, slot)) {
         return PSXE_MEMORY_CARD_INVALID_ARGUMENT;
     }
 
     memset(psxe_card_buffer, 0, sizeof(psxe_card_buffer));
+    if (!psxe_save_encode(psxe_card_buffer, sizeof(psxe_card_buffer),
+                          config->format_version, payload, payload_size)) {
+        return PSXE_MEMORY_CARD_INVALID_ARGUMENT;
+    }
     psxe_write_card_visual_header(config);
-    header = (psxe_save_header *)&psxe_card_buffer[PSXE_SAVE_DATA_OFFSET];
-    header->magic = PSXE_SAVE_MAGIC;
-    header->header_version = PSXE_SAVE_HEADER_VERSION;
-    header->format_version = config->format_version;
-    header->payload_size = (uint32_t)payload_size;
-    header->payload_crc = psxe_crc32((const uint8_t *)payload, payload_size);
-    memcpy((uint8_t *)(header + 1), payload, payload_size);
 
     descriptor = open(filename, FWRITE);
     if ((descriptor < 0) && (_get_errno() == 2)) {
@@ -246,8 +216,6 @@ psxe_memory_card_result psxe_memory_card_load(
     size_t payload_capacity,
     size_t *payload_size
 ) {
-    const psxe_save_header *header;
-    const uint8_t *stored_payload;
     char filename[32];
     int descriptor;
     int bytes_read;
@@ -267,28 +235,8 @@ psxe_memory_card_result psxe_memory_card_load(
         return PSXE_MEMORY_CARD_IO_ERROR;
     }
 
-    header = (const psxe_save_header *)&psxe_card_buffer[PSXE_SAVE_DATA_OFFSET];
-    if ((header->magic != PSXE_SAVE_MAGIC) || (header->header_version != PSXE_SAVE_HEADER_VERSION) ||
-        (header->payload_size == 0) || (header->payload_size > PSXE_MAX_SAVE_PAYLOAD)) {
-        return PSXE_MEMORY_CARD_CORRUPT;
-    }
-    if (header->format_version != config->format_version) {
-        return PSXE_MEMORY_CARD_VERSION_MISMATCH;
-    }
-    if (header->payload_size > payload_capacity) {
-        return PSXE_MEMORY_CARD_INVALID_ARGUMENT;
-    }
-
-    stored_payload = (const uint8_t *)(header + 1);
-    if (psxe_crc32(stored_payload, header->payload_size) != header->payload_crc) {
-        return PSXE_MEMORY_CARD_CORRUPT;
-    }
-
-    memcpy(payload, stored_payload, header->payload_size);
-    if (payload_size != NULL) {
-        *payload_size = header->payload_size;
-    }
-    return PSXE_MEMORY_CARD_OK;
+    return psxe_save_decode(psxe_card_buffer, sizeof(psxe_card_buffer), config->format_version,
+                            payload, payload_capacity, payload_size);
 }
 
 const char *psxe_memory_card_result_string(psxe_memory_card_result result) {

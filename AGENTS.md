@@ -85,7 +85,7 @@ silently simulate faster/slower without an explicit game policy.
 ## Critical Implementation Contracts
 
 - **Packet arena:** `psxe_renderer_allocate` in
-  [`src/render/render.c`](src/render/render.c) (declared for the renderer
+  [`src/render/packet.c`](src/render/packet.c) (declared for the renderer
   translation units in [`src/render/render_internal.h`](src/render/render_internal.h))
   is the only allocator for target GPU packets. It aligns to four bytes, checks
   `packet_end`, and increments `dropped_primitives` on failure. Every draw path
@@ -286,17 +286,29 @@ mean physical port/card slots 1 and 2 (`bu00:` and `bu10:`).
 
 ### [`src/platform/memory_card.c`](src/platform/memory_card.c)
 
-Owns BIOS card initialization, filenames, BIOS-visible header/icon, PSXE header,
-CRC32, and exact-block file I/O.
+Owns BIOS card initialization, filenames, BIOS-visible header/icon, and
+exact-block file I/O.
 
 - **Key subparts:** `psxe_make_filename` enforces the 20-character card filename
   payload; `psxe_write_card_visual_header` creates one static icon;
-  `psxe_memory_card_load` validates before copy.
+  `psxe_memory_card_load` delegates to the save format decoder after an exact-block read.
 - **Tests:** DuckStation save, overwrite, load, listing, and deletion in both
   slots. Card-full, removal, unformatted, and hardware cases remain open.
 - **Common mistake:** changing payload layout without incrementing
   `format_version` makes old data appear valid. Do not return a partially read
   payload.
+
+### [`src/core/save_format.c`](src/core/save_format.c)
+
+`psxe_save_encode` and `psxe_save_decode` own the little-endian version 1 engine
+header at byte 512 and its payload CRC32. Decode validates before modifying
+caller output. Host tests lock down the serialized bytes and corruption paths.
+
+### [`src/core/asset_formats.c`](src/core/asset_formats.c)
+
+`psxe_tim_parse` and `psxe_vag_parse` validate the same sized inputs consumed by
+the managed VRAM and SPU upload paths. Their views borrow the input buffer.
+They execute on the host without DMA or hardware register access.
 
 ### [`src/include/psxe/cd.h`](src/include/psxe/cd.h) and [`src/platform/cd.c`](src/platform/cd.c)
 
@@ -304,6 +316,8 @@ Owns ISO9660 file lookup, byte ranges, sector DMA, LBA seeks, spindle and
 transport control, XA filtering, and CD-DA. The drive serves one operation
 at a time. The byte-range reader uses a shared 2048-byte scratch sector for
 partial or unaligned reads. Audio and data share the drive.
+If SDK initialization returns with an outstanding command, `psxe_cd_init`
+retries `CdlInit` with a frame-bounded wait before enabling data callbacks.
 
 ### [`src/include/psxe/memory.h`](src/include/psxe/memory.h) and [`src/core/memory.c`](src/core/memory.c)
 
@@ -327,13 +341,11 @@ without mutating shared mesh data.
 
 ### [`src/render/render.c`](src/render/render.c)
 
-Owns GPU/GTE setup, double-buffered ordering tables, packet allocation, camera
+Owns GPU/GTE setup, double-buffered ordering tables, camera
 composition, per-mesh GTE light installation, TIM upload, mesh submission,
 panels, and font sorting.
 
-- **Key functions:** `psxe_renderer_allocate` enforces packet bounds;
-  `psxe_renderer_bucket` resolves the current destination table;
-  `psxe_make_object_matrix` combines inverse camera and object transform;
+- **Key functions:** `psxe_make_object_matrix` combines inverse camera and object transform;
   `psxe_draw_mesh_lights` validates indices, resolves material texture/color/
   effects, selects lights, installs GTE state, transforms three vertices,
   rejects backfaces/depth, optionally lights, then emits `POLY_F3`/`POLY_FT3`
@@ -342,30 +354,38 @@ panels, and font sorting.
   `psxe_renderer_end_frame` owns synchronization, pass-chain submission, and
   buffer flip.
 - **Tests:** target compilation and cube rendering. Near-plane clipping,
-  off-screen clipping, TIM sample assets, fog, Gouraud shading, packet stress,
+  off-screen clipping, fog, Gouraud shading, target packet stress,
   PAL, and hardware captures are gaps.
 - **Common mistakes:** PS1 texture pages use word-based TIM widths; 16-bit page
   `u` is `x & 63`; state packets for sprites must execute before sprite packets
   despite LIFO OT insertion; GTE global state must be re-established per mesh.
 
+### [`src/render/packet.c`](src/render/packet.c)
+
+Owns `psxe_renderer_allocate` and `psxe_renderer_bucket`. Capacity checks use
+the remaining byte count before computing the result pointer. Host tests cover
+alignment, exact fills, overflow, and layer clamping.
+
 ### [`src/render/render_internal.h`](src/render/render_internal.h)
 
-Private declarations shared by renderer translation units (and
-`src/core/scene.c` for CPU vector math): the packet allocator, destination-bucket
-lookup, ABR rewrite helper, `psxe_light_state`, `psxe_light_select`,
-`psxe_vector_normalize`, and `psxe_matrix_apply`. Not installed as public API;
-do not include it from games.
+Private renderer declarations for the packet allocator, destination-bucket
+lookup, ABR rewrite helper, `psxe_light_state`, and `psxe_light_select`.
+
+### [`src/core/fixed.c`](src/core/fixed.c)
+
+Owns the CPU-only `psxe_vector_normalize` and `psxe_matrix_apply` used by the
+scene and lighting code. Normalize rescales int32 components before squaring.
+Host tests cover zero, signed, and extreme inputs and 4.12 matrix application.
 
 ### [`src/render/light.c`](src/render/light.c)
 
 Owns `psxe_light_*` value helpers, the renderer light set
 (`psxe_renderer_clear/add/set_lights`, `psxe_renderer_light`,
 `psxe_renderer_set_ambient`, the `psxe_renderer_set_directional_light`
-wrapper), per-mesh selection, CPU integer sqrt/normalize, and
+wrapper), per-mesh selection, and
 `psxe_draw_light_marker`.
 
-- **Key subparts:** `psxe_vector_normalize` rescales any int32 vector into
-  0x2000..0x3fff before squaring; `psxe_consider_light` applies masks,
+- **Key subparts:** `psxe_consider_light` applies masks,
   attenuation (`LINEAR` t, `SMOOTH` t², `NONE`), and top-three ranking by
   scaled `r+g+b`; the marker projects on the CPU into bucket 1.
 - **Tests:** target compile and cube sample (sun + orbiting lamp + ambient
@@ -424,7 +444,8 @@ iteration.
   light is enabled (mesh visibility does not matter);
   `psxe_scene_render` gathers once, then submits active visible meshes with
   their material and those lights.
-- **Tests:** cube integration; focused generation/capacity unit tests are absent.
+- **Tests:** cube integration and host tests for handle generations, scene
+  capacity, light-slot exhaustion, and release on entity destruction.
 
 ### [`src/include/psxe/engine.h`](src/include/psxe/engine.h)
 
@@ -449,8 +470,9 @@ headers to reduce coupling; do not define behavior here.
 
 ### [`samples/cube/CMakeLists.txt`](samples/cube/CMakeLists.txt)
 
-Builds the `psxe_cube` PS-X executable, links `psxe`, and registers the ISO image
-target. Add sample-specific embedded assets with PSn00bSDK helpers here.
+Builds the `psxe_cube` PS-X executable, links `psxe`, stages the ISO inputs with
+a fixed UTC timestamp, and registers the ISO image target. Add sample-specific
+embedded assets with PSn00bSDK helpers here.
 
 ### [`samples/cube/main.c`](samples/cube/main.c)
 
@@ -474,9 +496,17 @@ PS1 BIOS boot configuration. `BOOT` must exactly match the executable entry in
 
 ### [`samples/cube/iso.xml`](samples/cube/iso.xml)
 
-Defines volume identifiers, boot files, documentation, and padding for
-`mkpsxiso`. Paths are configured relative to the sample build directory unless
-made source-absolute. Keep disc entry names uppercase 8.3.
+Defines volume identifiers, fixed timestamps, boot files, documentation, and
+padding for `mkpsxiso`. File paths refer to `disc/` in the sample build directory.
+Keep disc entry names uppercase 8.3.
+
+### [`tests/`](tests/)
+
+`host/run.sh` uses a native C compiler with the pinned SDK headers to test CPU
+modules. `reproducible_disc.sh` compares clean target builds from different
+directories and time zones. `check_markdown_links.py` checks repository-local
+inline links and heading anchors. [GitHub Actions](.github/workflows/ci.yml)
+runs the host and target checks.
 
 ### [`thirds/versions.env`](thirds/versions.env)
 
@@ -680,9 +710,11 @@ and Homebrew. Commands are repository-root relative:
 ```sh
 ./thirds/setup_macos.sh             # networked, long-running, mutates thirds/ and Homebrew host packages
 ./thirds/setup_macos.sh --check     # audits installed target dependencies
-bash -n build.sh run.sh thirds/setup_macos.sh
+PSXE_SANITIZE=1 tests/host/run.sh     # native CPU tests, with address and undefined behavior sanitizers
+python3 tests/check_markdown_links.py
 ./build.sh debug                    # configures, compiles, and creates sample BIN/CUE
 ./build.sh release
+tests/reproducible_disc.sh release  # compares two fresh PS-X EXE and BIN/CUE builds
 PCSX_REDUX=/path/to/PCSX-Redux ./run.sh debug
 git diff --check
 ```
@@ -695,11 +727,10 @@ cmake --preset debug
 cmake --build --preset debug
 ```
 
-There is no automated unit, lint, format, serial smoke, emulator screenshot, or
-hardware suite yet. The cube sample is the current integration build. A release
-claim additionally requires boot/input/audio/save/render checks in accurate
-emulators and on original hardware; burning documentation and regional license
-data handling are planned, not shipped.
+The cube sample is the target integration build. A release claim additionally
+requires boot/input/audio/save/render checks in accurate emulators and on
+original hardware. Serial smoke, emulator screenshots, and physical-media
+validation remain open.
 
 ## Test Ownership Map
 
@@ -709,14 +740,19 @@ data handling are planned, not shipped.
 - 3D/light objects/scene lights/UI, materials/effects, objects, sprites, render targets, and
   input/save integration → [`samples/cube/main.c`](samples/cube/main.c)
   (manual runtime and DuckStation smoke checks).
-- Script syntax → `bash -n build.sh run.sh thirds/setup_macos.sh`.
+- Script syntax → run `bash -n` on each script, as in the GitHub Actions host job.
 - Dependency installation → `./thirds/setup_macos.sh --check`.
 - Disc data/audio, mesh and texture lifetime → DuckStation checks with the
   cube disc plus temporary smoke executables. A separate mixed-mode disc
   checks XA filter/mute/pause and CD-DA track-end auto-pause. Original hardware
   tests remain open.
-- Memory-card corruption/capacity/removal → no focused tests; explicit known
-  gap and near-term roadmap item.
+- CD startup recovery → the DuckStation NTSC-U baseline timed out during
+  SDK initialization and skipped the disc assets. A debug smoke build with
+  the retry loaded the TIM and VAG, started an SPU voice, round-tripped saves
+  in both slots, and reported two render-target passes with zero dropped
+  primitives at frame 120.
+- Memory-card corruption and version/size checks → host save-format tests.
+  Card-full, removal, and physical I/O remain emulator/hardware cases.
 
 ## Data, Security, Privacy, and Compatibility Boundaries
 
@@ -753,8 +789,8 @@ data handling are planned, not shipped.
 
 ### Known Gaps
 
-- No automated tests, CI, emulator smoke harness, profiling, or original-hardware
-  validation.
+- Hosted CI verification, an emulator smoke harness, profiling, and
+  original-hardware validation are open.
 - Renderer lacks clipping, subdivision, production culling, animation, fog,
   Gouraud shading, and asset cooking.
 - SPU reclamation, mixed audio/data scheduling, and asynchronous card I/O are open.

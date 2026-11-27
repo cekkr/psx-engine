@@ -10,11 +10,15 @@ project(
 option(PSXE_BUILD_SAMPLES "Build bundled sample games" ON)
 
 set(PSXE_SOURCES
+    src/core/asset_formats.c
     src/core/engine.c
+    src/core/fixed.c
     src/core/memory.c
+    src/core/save_format.c
     src/core/scene.c
     src/render/render.c
     src/render/object.c
+    src/render/packet.c
     src/render/sprite.c
     src/render/target.c
     src/render/light.c

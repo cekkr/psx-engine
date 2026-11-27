@@ -1,0 +1,54 @@
+name: Engine checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Check Markdown links and shell syntax
+        shell: bash
+        run: |
+          python3 tests/check_markdown_links.py
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(git ls-files -z -- '*.sh' 'thirds/versions.env')
+      - name: Run host tests with pinned PSn00bSDK headers
+        shell: bash
+        run: |
+          source thirds/versions.env
+          sdk_source="$RUNNER_TEMP/psn00bsdk"
+          git init "$sdk_source"
+          git -C "$sdk_source" fetch --depth=1 https://github.com/Lameguy64/PSn00bSDK.git "$PSN00BSDK_COMMIT"
+          git -C "$sdk_source" checkout --detach FETCH_HEAD
+          PSXE_SDK_INCLUDE="$sdk_source/libpsn00b/include" PSXE_SANITIZE=1 tests/host/run.sh
+
+  target:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: toolchain
+        with:
+          path: |
+            thirds/toolchain
+            thirds/psn00bsdk
+            thirds/env.sh
+          key: psxe-macos-15-${{ runner.arch }}-${{ github.event.repository.name }}-${{ hashFiles('thirds/versions.env', 'thirds/setup_macos.sh') }}
+      - name: Bootstrap PSX toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: ./thirds/setup_macos.sh
+      - name: Build and package debug cube
+        run: ./build.sh debug
+      - name: Check independent release builds
+        run: tests/reproducible_disc.sh release

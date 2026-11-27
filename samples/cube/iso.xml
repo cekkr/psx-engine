@@ -9,15 +9,18 @@
       data_preparer="PSN00BSDK ${PSN00BSDK_VERSION}"
       application="PLAYSTATION"
       copyright="LICENSE.TXT;1"
+      creation_date="2000010100000000+0"
+      modification_date="2000010100000000+0"
     />
+    <default_attributes gmt_offs="0" />
     <directory_tree>
-      <file name="SYSTEM.CNF" type="data" source="${PROJECT_SOURCE_DIR}/samples/cube/system.cnf" />
-      <file name="PSXE_CUB.EXE" type="data" source="psxe_cube.exe" />
-      <file name="README.TXT" type="data" source="${PROJECT_SOURCE_DIR}/README.md" />
-      <file name="LICENSE.TXT" type="data" source="${PROJECT_SOURCE_DIR}/LICENSE" />
-      <dir name="ASSETS" source="${CMAKE_CURRENT_SOURCE_DIR}/assets">
-        <file name="PAINTED.TIM" type="data" source="${CMAKE_CURRENT_SOURCE_DIR}/assets/painted.tim" />
-        <file name="CHIME.VAG" type="data" source="${CMAKE_CURRENT_SOURCE_DIR}/assets/chime.vag" />
+      <file name="SYSTEM.CNF" type="data" source="disc/SYSTEM.CNF" />
+      <file name="PSXE_CUB.EXE" type="data" source="disc/PSXE_CUB.EXE" />
+      <file name="README.TXT" type="data" source="disc/README.TXT" />
+      <file name="LICENSE.TXT" type="data" source="disc/LICENSE.TXT" />
+      <dir name="ASSETS" source="disc/ASSETS">
+        <file name="PAINTED.TIM" type="data" source="disc/ASSETS/PAINTED.TIM" />
+        <file name="CHIME.VAG" type="data" source="disc/ASSETS/CHIME.VAG" />
       </dir>
       <dummy sectors="256" />
     </directory_tree>

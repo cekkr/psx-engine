@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "../render/render_internal.h"
+#include "fixed.h"
 
 #define PSXE_INVALID_ENTITY_INDEX UINT16_MAX
 

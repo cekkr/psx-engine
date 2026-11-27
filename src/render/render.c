@@ -7,27 +7,6 @@
 
 #include "render_internal.h"
 
-void *psxe_renderer_allocate(psxe_renderer *renderer, size_t size) {
-    uintptr_t current = (uintptr_t)renderer->next_packet;
-    uintptr_t aligned = (current + 3u) & ~(uintptr_t)3u;
-    uint8_t *result = (uint8_t *)aligned;
-
-    if ((result + size) > renderer->packet_end) {
-        ++renderer->dropped_primitives;
-        return NULL;
-    }
-
-    renderer->next_packet = result + size;
-    return result;
-}
-
-uint32_t *psxe_renderer_bucket(psxe_renderer *renderer, unsigned int layer) {
-    if (layer >= renderer->ot_length) {
-        layer = (unsigned int)renderer->ot_length - 1u;
-    }
-    return &renderer->ordering_table[layer];
-}
-
 static psxe_color psxe_resolve_color(psxe_color face, const psxe_material *material) {
     psxe_color result = face;
     unsigned int r;

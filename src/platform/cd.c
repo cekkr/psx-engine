@@ -83,6 +83,13 @@ psxe_cd_result psxe_cd_init(void) {
     if (CdInit() != 1) {
         return PSXE_CD_NOT_READY;
     }
+    /* The SDK can return success after its busy-loop wait expires. The
+     * Demute it sends on return can cancel the pending Init response. Retry
+     * Init with the frame-bounded wait so the stale command cannot block I/O. */
+    if ((CdSync(1, NULL) == CdlNoIntr) &&
+        (!psxe_cd_command(CdlInit, NULL, 0, false) || !psxe_cd_command(CdlDemute, NULL, 0, false))) {
+        return PSXE_CD_NOT_READY;
+    }
     CdReadyCallback(psxe_cd_sector_interrupt);
     CdAutoPauseCallback(psxe_cd_sector_interrupt);
     psxe_cd_ready = true;

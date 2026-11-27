@@ -836,7 +836,7 @@ start at program-area MSF 00:02:00 and have 75 sectors per second.
 
 | Function | Behavior |
 | --- | --- |
-| `psxe_cd_init()` | Initializes the drive after renderer/IRQ setup. Call before other CD operations. |
+| `psxe_cd_init()` | Initializes the drive after renderer/IRQ setup. Retries a pending SDK initialization with the engine's frame-based command timeout. Returns `PSXE_CD_NOT_READY` if initialization fails. Call before other CD operations. |
 | `psxe_cd_status(&status)` | Reports lid, spindle, seek, data/XA read, and CD-DA play state. May be queried during audio playback. |
 | `psxe_cd_seek(lba, audio_track)` | Waits for a logical data-header seek or a physical subchannel seek when `audio_track` is true. |
 | `psxe_cd_position(&lba)` | Reports the current physical head position from subchannel Q. Data reads use the exact requested LBA. |
@@ -910,8 +910,10 @@ and `PSXE_MEMORY_CARD_FULL`.
 
 The file name is `bu00:` (slot 0 = physical slot 1) or `bu10:` (slot 1)
 followed by `product_code` and `identifier`. Each identity is one 8192-byte
-file with a BIOS header, a static icon, and an engine header (magic, version,
-size, CRC32) at byte 512.
+file with a BIOS header, a static icon, and a 16-byte little-endian engine
+header at byte 512. Its fields are the four magic bytes `PXSE`, the 16-bit
+header version (`1`), the 16-bit game `format_version`, the 32-bit payload
+length, and the 32-bit CRC32 of the payload. Payload bytes start at byte 528.
 
 | Function | Behavior |
 | --- | --- |
