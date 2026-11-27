@@ -118,18 +118,13 @@ bool psxe_render_target_begin(psxe_renderer *renderer, const psxe_render_target 
 
     /* All pass storage comes from this frame's packet arena, so it shares the
      * double-buffered lifetime of every other packet. All or nothing. */
-    ordering_table = psxe_renderer_allocate(renderer, (size_t)target->ot_length * sizeof(uint32_t));
+    const size_t table_size = (size_t)target->ot_length * sizeof(*ordering_table);
+    ordering_table = psxe_renderer_allocate(renderer, table_size + (2u * sizeof(*enter)));
     if (ordering_table == NULL) {
         return false;
     }
-    enter = psxe_renderer_allocate(renderer, sizeof(*enter));
-    if (enter == NULL) {
-        return false;
-    }
-    leave = psxe_renderer_allocate(renderer, sizeof(*leave));
-    if (leave == NULL) {
-        return false;
-    }
+    enter = (DR_ENV *)((uint8_t *)ordering_table + table_size);
+    leave = enter + 1;
 
     ClearOTagR(ordering_table, target->ot_length);
     psxe_build_env(

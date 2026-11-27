@@ -55,6 +55,8 @@ psxe_cd_result psxe_cd_read_start(
 psxe_cd_result psxe_cd_read_poll(void);
 psxe_cd_result psxe_cd_read_wait(void);
 psxe_cd_result psxe_cd_read_cancel(void);
+/* Successful data and raw DMA sectors since boot, including filesystem reads. */
+uint32_t psxe_cd_sectors_read(void);
 
 /* Blocking ISO9660 lookup and exact byte-range read. */
 psxe_cd_result psxe_cd_find(const char *path, psxe_cd_file *file);

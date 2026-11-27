@@ -119,6 +119,12 @@ The sample uses source-defined geometry and two original, repository-owned
 assets in `samples/cube/assets`. The disc contains a two-palette 4-bpp TIM
 with baked brick shading and a short mono VAG chime.
 
+The debug build refreshes its diagnostics HUD and writes the same measurements
+to the BIOS TTY once per video second. Enable BIOS TTY logging in DuckStation
+to see CPU and GPU-wait ticks, packet use and drops, rejected faces, CD sectors,
+VRAM tiles, and resident SPU bytes. A timing value of `65535` marks the timer
+limit of about 15.48 ms. The release sample uses the compact frame and light HUD.
+
 ## Programming model
 
 A game supplies `init`, `update`, `render`, and optional `shutdown` callbacks to
@@ -140,8 +146,10 @@ static void update(psxe_engine *engine, void *data) {
 All hot-path storage is statically sized. Override `PSXE_OT_LENGTH`,
 `PSXE_PACKET_BUFFER_SIZE`, or `PSXE_MAX_ENTITIES` at compile time when a game
 has measured a different requirement. When the primitive arena fills, drawing
-is dropped and counted in `psxe_renderer.dropped_primitives`; memory is never
-overwritten.
+is dropped and counted in `psxe_renderer.dropped_primitives`. The previous
+frame's `packet_bytes` and the lifetime `packet_high_water` include offscreen
+ordering tables. Games can opt into timing with `render.profile_timing` and
+reserve hardware Timer 2 for the engine.
 
 Use the caller-owned heap and VRAM pool for level assets and release them
 between frames. Baked materials can combine `PSXE_EFFECT_RAW_TEXTURE` and

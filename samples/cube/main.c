@@ -29,6 +29,9 @@ typedef struct cube_game {
     int16_t lamp_angle;
     bool show_markers;
     char status[64];
+#ifdef PSXE_CUBE_DIAGNOSTICS
+    char diagnostics[4][39];
+#endif
 } cube_game;
 
 static const SVECTOR cube_vertices[] = {
@@ -292,11 +295,48 @@ static void game_init(psxe_engine *engine, void *user_data) {
     snprintf(game->status, sizeof(game->status), "START: SAVE  SELECT: LOAD");
 }
 
+#ifdef PSXE_CUBE_DIAGNOSTICS
+static void update_diagnostics(psxe_engine *engine, cube_game *game) {
+    if ((engine->frame == 0) || ((engine->frame % engine->ticks_per_second) != 0)) {
+        return;
+    }
+
+    const psxe_renderer *renderer = &engine->renderer;
+    const psxe_vram_stats vram = psxe_vram_get_stats(&game->vram);
+    const psxe_audio_stats spu = psxe_audio_get_stats(&engine->audio);
+    const unsigned long cd = (unsigned long)psxe_cd_sectors_read();
+    const unsigned int vram_capacity = (unsigned int)vram.used_tiles + vram.free_tiles;
+    const unsigned long spu_capacity = (unsigned long)spu.used_bytes + spu.free_bytes;
+
+    snprintf(game->diagnostics[0], sizeof(game->diagnostics[0]), "CPU %u GPU %u TICKS",
+             (unsigned int)engine->cpu_ticks, (unsigned int)renderer->gpu_wait_ticks);
+    snprintf(game->diagnostics[1], sizeof(game->diagnostics[1]), "PRIMS %lu DROP %lu REJ %lu RT %u",
+             (unsigned long)renderer->submitted_primitives, (unsigned long)renderer->dropped_primitives,
+             (unsigned long)renderer->rejected_faces, (unsigned int)renderer->target_passes);
+    snprintf(game->diagnostics[2], sizeof(game->diagnostics[2]), "PACK %lu MAX %lu CD %lu",
+             (unsigned long)renderer->packet_bytes, (unsigned long)renderer->packet_high_water, cd);
+    snprintf(game->diagnostics[3], sizeof(game->diagnostics[3]), "VRAM %u/%u SPU %lu B",
+             (unsigned int)vram.used_tiles, vram_capacity, (unsigned long)spu.used_bytes);
+
+    printf("PSXE frame=%lu cpu_ticks=%u gpu_wait_ticks=%u prims=%lu drop=%lu rejected=%lu passes=%u\n",
+           (unsigned long)(engine->frame - 1u), (unsigned int)engine->cpu_ticks,
+           (unsigned int)renderer->gpu_wait_ticks, (unsigned long)renderer->submitted_primitives,
+           (unsigned long)renderer->dropped_primitives, (unsigned long)renderer->rejected_faces,
+           (unsigned int)renderer->target_passes);
+    printf("PSXE packets=%lu peak=%lu cd_sectors=%lu vram_tiles=%u/%u spu_bytes=%lu/%lu\n",
+           (unsigned long)renderer->packet_bytes, (unsigned long)renderer->packet_high_water, cd,
+           (unsigned int)vram.used_tiles, vram_capacity, (unsigned long)spu.used_bytes, spu_capacity);
+}
+#endif
+
 static void game_update(psxe_engine *engine, void *user_data) {
     cube_game *game = user_data;
     psxe_entity *entity = psxe_scene_get(&game->scene, game->cube);
     const psxe_pad_state *pad = psxe_input_pad(&engine->input, 0);
 
+#ifdef PSXE_CUBE_DIAGNOSTICS
+    update_diagnostics(engine, game);
+#endif
     entity->transform.rotation.vx += 10;
     entity->transform.rotation.vy += 14;
     psxe_object_rotate(&game->mini_cube, 0, 24, 8);
@@ -421,6 +461,13 @@ static void game_render(psxe_engine *engine, void *user_data) {
     psxe_ui_panel(&engine->renderer, 4, 4, 312, 34, (psxe_color){ 16, 16, 28 }, true);
     psxe_ui_text(&engine->renderer, 10, 10, "PSX-ENGINE / 3D FOUNDATION");
     psxe_ui_text(&engine->renderer, 10, 20, game->status);
+#ifdef PSXE_CUBE_DIAGNOSTICS
+    for (index = 0; index < PSXE_ARRAY_COUNT(game->diagnostics); ++index) {
+        if (game->diagnostics[index][0]) {
+            psxe_ui_text(renderer, 10, (int16_t)(174u + index * 10u), game->diagnostics[index]);
+        }
+    }
+#else
     snprintf(
         diagnostics,
         sizeof(diagnostics),
@@ -430,7 +477,8 @@ static void game_render(psxe_engine *engine, void *user_data) {
         (unsigned long)engine->renderer.dropped_primitives,
         (unsigned int)engine->renderer.target_passes
     );
-    psxe_ui_text(&engine->renderer, 10, 228, diagnostics);
+    psxe_ui_text(&engine->renderer, 10, 208, diagnostics);
+#endif
     snprintf(
         diagnostics,
         sizeof(diagnostics),
@@ -465,7 +513,10 @@ int main(void) {
             .height = 240,
             .video_mode = PSXE_VIDEO_NTSC,
             .clear_color = { 22, 28, 48 },
-            .dither = true
+            .dither = true,
+#ifdef PSXE_CUBE_DIAGNOSTICS
+            .profile_timing = true,
+#endif
         },
         .memory_card = {
             .product_code = "BAPXE-00001",

@@ -25,6 +25,11 @@ typedef struct psxe_vram {
     psxe_vram_slot slots[PSXE_VRAM_MAX_TEXTURES];
 } psxe_vram;
 
+typedef struct psxe_vram_stats {
+    uint16_t used_tiles;
+    uint16_t free_tiles;
+} psxe_vram_stats;
+
 void psxe_vram_init(psxe_vram *vram, const psxe_renderer *renderer);
 /* Permanently exclude caller-managed VRAM, such as fixed render targets.
  * Coordinates and width are in halfwords. Rectangles are rounded to tiles. */
@@ -35,5 +40,7 @@ bool psxe_vram_load_tim(psxe_vram *vram, const void *data, size_t size, psxe_vra
 const psxe_texture *psxe_vram_get(const psxe_vram *vram, psxe_vram_id id);
 bool psxe_vram_palette(const psxe_vram *vram, psxe_vram_id id, unsigned int palette, psxe_texture *view);
 bool psxe_vram_free(psxe_vram *vram, psxe_vram_id id);
+/* Includes reservations, framebuffers, debug font, pixels and palettes. */
+psxe_vram_stats psxe_vram_get_stats(const psxe_vram *vram);
 
 #endif

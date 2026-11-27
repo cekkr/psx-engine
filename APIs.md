@@ -128,6 +128,7 @@ struct psxe_engine {
     psxe_memory_card_config memory_card;
     uint32_t frame;              /* incremented after every rendered frame */
     uint16_t ticks_per_second;   /* 60 NTSC, 50 PAL */
+    uint16_t cpu_ticks;          /* last frame's input, update and render interval */
     bool running;
 };
 ```
@@ -189,13 +190,13 @@ int main(void) {
 | `psxe_object` | `mesh` + `transform` + `material` + `visible`. See [Objects](#objects--psxe_object). |
 | `psxe_sprite` | Screen rectangle with texel region, size, `layer`, `material`, `visible`. See [Sprites](#sprites--psxe_sprite). |
 | `psxe_render_target`, `psxe_render_target_config` | Offscreen VRAM rectangle usable as a texture. See [Render to texture](#render-to-texture--psxe_render_target). |
-| `psxe_render_config` | `width`, `height`, `video_mode`, `clear_color`, `dither`. |
+| `psxe_render_config` | `width`, `height`, `video_mode`, `clear_color`, `dither`, `profile_timing`. |
 | `psxe_camera` | `position` (world), `rotation` (Euler), `projection` (GTE screen distance; larger = narrower field of view, default 160). |
 | `psxe_texture` | VRAM location filled by `psxe_texture_load_tim`: `tpage`, `clut`, `width`, `height`, base `u`/`v`, `valid`. |
 | `psxe_face` | One triangle: `vertex[3]` indices, `normal` index, `uv[3][2]` offsets from the texture's base `u`/`v`, flat `color`, material `flags`. |
 | `psxe_mesh` | Borrowed `vertices`, `normals`, `faces` arrays with their counts, plus an optional `texture`. |
 | `psxe_light`, `psxe_light_set`, `psxe_light_type`, `psxe_light_falloff` | Light values and the renderer's fixed set. See [Lights](#lights--psxe_light). |
-| `psxe_renderer` | Double buffers and frame state. Fields worth reading: `submitted_primitives`, `dropped_primitives`, `target_passes`, `next_packet`/`packet_end`, `width`, `height`, `camera`, `lights`, and the per-frame light counters `lights_considered`, `lights_applied`, `lights_folded`, `lights_dropped`. `ordering_table`/`ot_length` point at the current destination (main buffer, or a render target during a pass); the other fields are internal. |
+| `psxe_renderer` | Double buffers, frame state, and the diagnostics described below. `ordering_table`/`ot_length` address the active pass. `next_packet`/`packet_end` bound the active packet arena. |
 
 ### `void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *config)`
 
@@ -209,8 +210,8 @@ enables display. `psxe_engine_init` calls it for you.
 
 ### `void psxe_renderer_begin_frame(psxe_renderer *renderer)`
 
-Resets `submitted_primitives`, `dropped_primitives`, `target_passes`, and the
-four light counters to zero. Called by the engine before `render`.
+Resets draw, rejection, target-pass, and light counters to zero. Called by
+the engine before `render`.
 
 ### `void psxe_renderer_end_frame(psxe_renderer *renderer)`
 
@@ -219,6 +220,28 @@ vblank (`VSync`), shows the previous buffer, submits this frame's offscreen
 passes (in the order they began) followed by the active ordering table, swaps
 buffers, resets the packet pointer, and clears the next ordering table. Called
 by the engine after `render`. Never reuse or modify a packet after this call.
+
+Read the following diagnostics during `update` to inspect the previous
+completed frame.
+
+| Field | Meaning |
+| --- | --- |
+| `submitted_primitives` | Draw packets linked by the draw helpers, including font glyphs and draw-mode packets. Render-target environment packets are tracked through `target_passes`. |
+| `dropped_primitives` | Failed packet reservations and faces with invalid vertex indices. A failed compound reservation counts once. |
+| `rejected_faces` | Faces skipped for invalid vertex indices, back-face rejection, or depth outside the active ordering table. |
+| `target_passes` | Successfully opened render-target passes. |
+| `packet_bytes`, `packet_high_water` | Arena bytes used by the completed frame and the peak since renderer initialization. Includes offscreen ordering tables and draw environment packets. |
+| `lights_considered`, `lights_applied`, `lights_folded`, `lights_dropped` | Per-frame light diagnostics. |
+| `gpu_wait_ticks` | Time spent waiting on `DrawSync` for the previous GPU submission. The subsequent VSync wait is excluded. |
+
+Set `.profile_timing = true` in `psxe_render_config` to collect
+`engine->cpu_ticks` and `renderer->gpu_wait_ticks`. The game grants the engine
+exclusive access to hardware Timer 2. CPU timing covers input polling,
+`update`, and `render` before `psxe_renderer_end_frame`. It measures elapsed
+time, including blocking calls made by the game. Both intervals use
+`PSXE_PROFILE_TICKS_PER_SECOND` (4,233,600 ticks per second). A reading of
+`UINT16_MAX` means the interval reached the timer limit, about 15.48 ms.
+Timing fields start at zero and stay zero when timing is disabled.
 
 ### `void psxe_renderer_set_camera(psxe_renderer *renderer, const psxe_camera *camera)`
 
@@ -844,6 +867,7 @@ start at program-area MSF 00:02:00 and have 75 sectors per second.
 | `psxe_cd_read_start(lba, sectors, mode, destination, capacity)` | Starts an IRQ-driven read into word-aligned RAM. `PSXE_CD_DATA` transfers `PSXE_CD_SECTOR_SIZE` (2048) bytes per sector. `PSXE_CD_RAW` transfers `PSXE_CD_RAW_SECTOR_SIZE` (2340) bytes per sector, including the sector header and excluding sync bytes. |
 | `psxe_cd_read_poll()`, `psxe_cd_read_wait()` | Check progress once or wait until complete. Success and errors finalize the transport before returning. The final poll may wait for the drive to pause. |
 | `psxe_cd_read_cancel()` | Disarms DMA to the caller's buffer and stops reading. May stop the spindle if pause is rejected during a seek. |
+| `uint32_t psxe_cd_sectors_read(void)` | Returns the running count of successful data and raw DMA sector transfers since boot, including filesystem reads and sectors transferred before cancellation. The unsigned counter wraps after `UINT32_MAX`. |
 | `psxe_cd_find(path, &file)` | Finds a contiguous file on a primary ISO9660 volume. Use slash or backslash, case-insensitive path components, and an optional `;1` suffix. Returns the starting LBA and byte length in `psxe_cd_file`. |
 | `psxe_cd_read_file(&file, offset, destination, size)` | Blocking exact byte-range read into caller-owned RAM. Partial sectors and unaligned destinations use a shared sector buffer. Re-resolve file extents after a disc change. |
 | `psxe_cd_play_xa(lba, file, channel, double_speed)` | Starts decoding the selected XA file/channel. The caller controls the playback range and calls pause/stop. |
@@ -877,6 +901,7 @@ typedef struct psxe_audio_sample {
 | `int psxe_audio_play(psxe_audio *audio, const psxe_audio_sample *sample, uint16_t volume, int16_t pan)` | Plays on the next voice (round robin over 24) and returns it, or `-1`. `volume` 0..`0x3fff`; `pan` `-0x1000` (left) .. `0` (center) .. `0x1000` (right); both are clamped. A busy voice is cut off. |
 | `void psxe_audio_stop(int voice)` | Keys off one voice; ignores out-of-range values (including `-1`). |
 | `void psxe_audio_stop_all(void)` | Keys off all 24 voices. Called by the engine after the loop exits. |
+| `psxe_audio_stats psxe_audio_get_stats(const psxe_audio *audio)` | Returns `used_bytes` and `free_bytes` in the aligned sample region `0x1040..0x7ffff`. Includes DMA padding. Returns zeros for a null or uninitialized context. |
 
 Uploads block on DMA; do them in `init` or during loading. Looping depends only
 on the loop flags encoded in the VAG blocks. There is no "is playing" query.
@@ -956,6 +981,7 @@ renderer. These operations are intended for initialization and level changes.
 | `psxe_vram_get(&vram, id)` | Returns a borrowed texture view or `NULL` for a stale ID. |
 | `psxe_vram_palette(&vram, id, row, &view)` | Copies a texture view using a zero-based CLUT row. Keeps the same uploaded texels. |
 | `psxe_vram_free(&vram, id)` | Synchronizes with submitted GPU work, invalidates the ID and recycles the texture and CLUT tiles. |
+| `psxe_vram_stats psxe_vram_get_stats(const psxe_vram *vram)` | Counts `used_tiles` and `free_tiles` in the 64 × 64 pool. Used tiles include buffers, the font, reservations, pixels, and CLUTs. Free tiles may be fragmented or cross texture-page boundaries. Returns zeros for a null or uninitialized pool. |
 
 Perform managed TIM uploads and frees outside frame builds, after detaching
 every mesh, material, and sprite that borrows the texture or a palette view.
@@ -1126,18 +1152,15 @@ from the target.
 
 ### 4. Render budget HUD and adaptive detail
 
-`begin_frame` clears the counters before `render`, and `update` runs before
-`begin_frame`. So during `update`, `submitted_primitives` and
-`dropped_primitives` still describe the **previous** frame. Use that to lower
-detail before the arena overflows, and measure packet bytes at the end of
-`render`.
+During `update`, `packet_bytes` and `dropped_primitives` describe the previous
+completed frame. Use them to lower detail when the arena runs short.
 
 ```c
 static void budget_update(psxe_engine *engine, my_game *g) {
     if (engine->renderer.dropped_primitives > 0) {
-        g->use_low_detail = true;                 /* last frame overflowed */
-    } else if (g->peak_packet_bytes < (PSXE_PACKET_BUFFER_SIZE / 2)) {
-        g->use_low_detail = false;                /* comfortable headroom */
+        g->use_low_detail = true;
+    } else if (engine->renderer.packet_bytes < (PSXE_PACKET_BUFFER_SIZE / 2)) {
+        g->use_low_detail = false;
     }
 }
 
@@ -1146,27 +1169,19 @@ static void budget_render(psxe_engine *engine, my_game *g) {
     const psxe_mesh *tree = g->use_low_detail ? &tree_low : &tree_high;
     char line[48];
     unsigned int i;
-    size_t used;
 
     for (i = 0; i < g->tree_count; ++i) {
         psxe_draw_mesh(r, tree, &g->trees[i]);     /* one mesh, many transforms */
     }
 
-    /* Bytes used so far = arena size minus what is left. */
-    used = PSXE_PACKET_BUFFER_SIZE - (size_t)(r->packet_end - r->next_packet);
-    g->peak_packet_bytes = used;
-
-    snprintf(line, sizeof(line), "PKT %lu/%u DROP %lu",
-             (unsigned long)used, (unsigned)PSXE_PACKET_BUFFER_SIZE,
-             (unsigned long)r->dropped_primitives);
-    psxe_ui_text(r, 8, 224, line);                 /* text itself costs packets */
+    snprintf(line, sizeof(line), "LAST PKT %lu PEAK %lu",
+             (unsigned long)r->packet_bytes, (unsigned long)r->packet_high_water);
+    psxe_ui_text(r, 8, 212, line);
 }
 ```
 
-Draw the HUD last if you want the byte count to include the 3D scene only, or
-measure again after the text if you want the full total. This recipe also shows
-instancing: one immutable `psxe_mesh` drawn with many transforms, with no scene
-entity needed.
+The completed-frame total includes the HUD and offscreen passes. The tree
+instances share one immutable mesh and each supply their own transform.
 
 ### 5. Per-object lighting in one frame
 
@@ -1452,10 +1467,10 @@ STP note above).
 | `render.h` (render to texture) | `psxe_render_target_init`, `psxe_render_target_begin`, `psxe_render_target_end`, `psxe_render_target_texture` |
 | `scene.h` | `psxe_scene_init`, `psxe_scene_create`, `psxe_scene_destroy`, `psxe_scene_get`, `psxe_scene_get_const`, `psxe_scene_render`, `psxe_scene_set_light`, `psxe_scene_clear_light`, `psxe_scene_light`, `psxe_scene_light_world`, `psxe_scene_gather_lights` |
 | `input.h` | `psxe_input_init`, `psxe_input_poll`, `psxe_input_rumble`, `psxe_input_stop_rumble`, `psxe_input_pad`, `psxe_button_held`, `psxe_button_pressed`, `psxe_button_released` |
-| `cd.h` | `psxe_cd_init`, `psxe_cd_status`, `psxe_cd_seek`, `psxe_cd_position`, `psxe_cd_motor_on`, `psxe_cd_pause`, `psxe_cd_stop`, `psxe_cd_read_start`, `psxe_cd_read_poll`, `psxe_cd_read_wait`, `psxe_cd_read_cancel`, `psxe_cd_find`, `psxe_cd_read_file`, `psxe_cd_play_xa`, `psxe_cd_xa_filter`, `psxe_cd_play_cdda`, `psxe_cd_set_audio_volume`, `psxe_cd_set_muted` |
+| `cd.h` | `psxe_cd_init`, `psxe_cd_status`, `psxe_cd_seek`, `psxe_cd_position`, `psxe_cd_motor_on`, `psxe_cd_pause`, `psxe_cd_stop`, `psxe_cd_read_start`, `psxe_cd_read_poll`, `psxe_cd_read_wait`, `psxe_cd_read_cancel`, `psxe_cd_sectors_read`, `psxe_cd_find`, `psxe_cd_read_file`, `psxe_cd_play_xa`, `psxe_cd_xa_filter`, `psxe_cd_play_cdda`, `psxe_cd_set_audio_volume`, `psxe_cd_set_muted` |
 | `memory.h` | `psxe_heap_init`, `psxe_heap_alloc`, `psxe_heap_free`, `psxe_heap_get_stats`, `psxe_mesh_alloc`, `psxe_mesh_free` |
-| `vram.h` | `psxe_vram_init`, `psxe_vram_reserve`, `psxe_vram_load_tim`, `psxe_vram_get`, `psxe_vram_palette`, `psxe_vram_free` |
-| `audio.h` | `psxe_audio_init`, `psxe_audio_upload_vag`, `psxe_audio_load_vag`, `psxe_audio_play`, `psxe_audio_stop`, `psxe_audio_stop_all` |
+| `vram.h` | `psxe_vram_init`, `psxe_vram_reserve`, `psxe_vram_load_tim`, `psxe_vram_get`, `psxe_vram_palette`, `psxe_vram_free`, `psxe_vram_get_stats` |
+| `audio.h` | `psxe_audio_init`, `psxe_audio_upload_vag`, `psxe_audio_load_vag`, `psxe_audio_play`, `psxe_audio_stop`, `psxe_audio_stop_all`, `psxe_audio_get_stats` |
 | `memory_card.h` | `psxe_memory_card_init`, `psxe_memory_card_save`, `psxe_memory_card_load`, `psxe_memory_card_status`, `psxe_memory_card_list`, `psxe_memory_card_delete`, `psxe_memory_card_result_string` |
 
 Not available yet (see [`ROADMAP.md`](ROADMAP.md)): near-plane clipping,

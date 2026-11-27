@@ -9,6 +9,7 @@
 #include "../core/asset_formats.h"
 
 #define PSXE_SPU_ALLOC_START 0x1010u
+#define PSXE_SPU_ALIGN_MASK 63u
 
 static bool psxe_audio_transfer(uint32_t address, const uint32_t *words, size_t size) {
     uint32_t timeout = 0x100000u;
@@ -46,15 +47,15 @@ bool psxe_audio_upload_vag(
         return false;
     }
 
-    uint32_t transfer_size = (vag.size + 63u) & ~63u;
-    address = (audio->next_spu_address + 63u) & ~63u;
+    uint32_t transfer_size = (vag.size + PSXE_SPU_ALIGN_MASK) & ~PSXE_SPU_ALIGN_MASK;
+    address = (audio->next_spu_address + PSXE_SPU_ALIGN_MASK) & ~PSXE_SPU_ALIGN_MASK;
     if ((address < PSXE_SPU_ALLOC_START) || (address > PSXE_SPU_RAM_END) ||
         (transfer_size > PSXE_SPU_RAM_END - address)) {
         return false;
     }
 
     SpuSetTransferMode(SPU_TRANSFER_BY_DMA);
-    uint32_t bulk_size = ((uintptr_t)vag.payload & 3u) ? 0u : vag.size & ~63u;
+    uint32_t bulk_size = ((uintptr_t)vag.payload & 3u) ? 0u : vag.size & ~PSXE_SPU_ALIGN_MASK;
     if (bulk_size && !psxe_audio_transfer(address, (const uint32_t *)vag.payload, bulk_size)) {
         return false;
     }
@@ -142,4 +143,14 @@ void psxe_audio_stop(int voice) {
 
 void psxe_audio_stop_all(void) {
     SpuSetKey(0, 0x00ffffffu);
+}
+
+psxe_audio_stats psxe_audio_get_stats(const psxe_audio *audio) {
+    if ((audio == NULL) || (audio->next_spu_address < PSXE_SPU_ALLOC_START) ||
+        (audio->next_spu_address > PSXE_SPU_RAM_END)) {
+        return (psxe_audio_stats){ 0 };
+    }
+    const uint32_t start = (PSXE_SPU_ALLOC_START + PSXE_SPU_ALIGN_MASK) & ~PSXE_SPU_ALIGN_MASK;
+    const uint32_t end = (audio->next_spu_address + PSXE_SPU_ALIGN_MASK) & ~PSXE_SPU_ALIGN_MASK;
+    return (psxe_audio_stats){ .used_bytes = end - start, .free_bytes = PSXE_SPU_RAM_END - end };
 }

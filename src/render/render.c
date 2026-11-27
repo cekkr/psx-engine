@@ -5,6 +5,7 @@
 
 #include <inline_c.h>
 
+#include "../platform/profile_internal.h"
 #include "render_internal.h"
 
 static psxe_color psxe_resolve_color(psxe_color face, const psxe_material *material) {
@@ -74,6 +75,7 @@ void psxe_renderer_init(psxe_renderer *renderer, const psxe_render_config *confi
     renderer->depth_shift = 2;
     renderer->camera = default_camera;
     renderer->dither = config->dither;
+    renderer->profile_timing = config->profile_timing;
 
     ResetGraph(0);
     SetVideoMode((config->video_mode == PSXE_VIDEO_PAL) ? MODE_PAL : MODE_NTSC);
@@ -116,6 +118,7 @@ void psxe_renderer_begin_frame(psxe_renderer *renderer) {
     renderer->frame_open = true;
     renderer->submitted_primitives = 0;
     renderer->dropped_primitives = 0;
+    renderer->rejected_faces = 0;
     renderer->target_passes = 0;
     renderer->lights_considered = 0;
     renderer->lights_applied = 0;
@@ -130,11 +133,21 @@ void psxe_renderer_end_frame(psxe_renderer *renderer) {
     /* A render-target pass left open is closed so its chain is terminated. */
     psxe_render_target_end(renderer);
 
+    if (renderer->profile_timing) {
+        psxe_profile_begin();
+    }
     DrawSync(0);
+    if (renderer->profile_timing) {
+        renderer->gpu_wait_ticks = psxe_profile_end();
+    }
     VSync(0);
 
     draw_buffer = &renderer->buffers[renderer->active_buffer];
     display_buffer = &renderer->buffers[renderer->active_buffer ^ 1];
+    renderer->packet_bytes = (uint32_t)(renderer->next_packet - draw_buffer->packets);
+    if (renderer->packet_bytes > renderer->packet_high_water) {
+        renderer->packet_high_water = renderer->packet_bytes;
+    }
     PutDispEnv(&display_buffer->display);
     if (renderer->pass_head != NULL) {
         /* Offscreen passes execute first, then the main ordering table. */
@@ -310,6 +323,7 @@ void psxe_draw_mesh_lights(
         if ((face->vertex[0] >= mesh->vertex_count) ||
             (face->vertex[1] >= mesh->vertex_count) ||
             (face->vertex[2] >= mesh->vertex_count)) {
+            ++renderer->rejected_faces;
             ++renderer->dropped_primitives;
             continue;
         }
@@ -324,6 +338,7 @@ void psxe_draw_mesh_lights(
         gte_stopz(&winding);
         if (!(flags & PSXE_MATERIAL_DOUBLE_SIDED) && !(effects & PSXE_EFFECT_DOUBLE_SIDED) &&
             (winding <= 0)) {
+            ++renderer->rejected_faces;
             continue;
         }
 
@@ -332,6 +347,7 @@ void psxe_draw_mesh_lights(
         depth = average_z >> renderer->depth_shift;
         /* Buckets 0 and 1 are reserved for text and 2D primitives. */
         if ((depth <= 1) || (depth >= (int)renderer->ot_length)) {
+            ++renderer->rejected_faces;
             continue;
         }
         bucket = &renderer->ordering_table[depth];
@@ -377,19 +393,12 @@ void psxe_draw_mesh_lights(
             addPrim(bucket, primitive);
             ++renderer->submitted_primitives;
         } else {
-            POLY_F3 *primitive;
-            DR_TPAGE *page = NULL;
-
             /* Untextured primitives blend with the GPU's current ABR bits, so
              * a state packet must execute first. Reserve it before the face so
              * an exhausted arena drops the whole face instead of mis-blending. */
-            if (semitransparent) {
-                page = psxe_renderer_allocate(renderer, sizeof(*page));
-                if (page == NULL) {
-                    continue;
-                }
-            }
-            primitive = psxe_renderer_allocate(renderer, sizeof(*primitive));
+            POLY_F3 *primitive = psxe_renderer_allocate(
+                renderer, sizeof(*primitive) + (semitransparent ? sizeof(DR_TPAGE) : 0u)
+            );
             if (primitive == NULL) {
                 continue;
             }
@@ -409,7 +418,8 @@ void psxe_draw_mesh_lights(
             }
             addPrim(bucket, primitive);
             ++renderer->submitted_primitives;
-            if (page != NULL) {
+            if (semitransparent) {
+                DR_TPAGE *page = (DR_TPAGE *)(primitive + 1);
                 /* addPrim prepends: inserted after, executes before. */
                 setDrawTPage(page, 0, renderer->dither ? 1 : 0, getTPage(0, blend, 0, 0));
                 addPrim(bucket, page);
@@ -429,30 +439,25 @@ void psxe_ui_panel(
     bool semitransparent
 ) {
     TILE *tile;
-    DR_TPAGE *page = NULL;
     if ((renderer == NULL) || (width <= 0) || (height <= 0)) {
         return;
     }
-    tile = psxe_renderer_allocate(renderer, sizeof(*tile));
+    tile = psxe_renderer_allocate(renderer, sizeof(*tile) + (semitransparent ? sizeof(DR_TPAGE) : 0u));
     if (tile == NULL) {
         return;
-    }
-    if (semitransparent) {
-        page = psxe_renderer_allocate(renderer, sizeof(*page));
-        if (page == NULL) {
-            return;
-        }
     }
     setTile(tile);
     setXY0(tile, x, y);
     setWH(tile, width, height);
     setRGB0(tile, color.r, color.g, color.b);
     setSemiTrans(tile, semitransparent ? 1 : 0);
-    addPrim(psxe_renderer_bucket(renderer, 1), tile);
+    uint32_t *bucket = psxe_renderer_bucket(renderer, 1);
+    addPrim(bucket, tile);
     ++renderer->submitted_primitives;
-    if (page != NULL) {
+    if (semitransparent) {
+        DR_TPAGE *page = (DR_TPAGE *)(tile + 1);
         setDrawTPage(page, 0, renderer->dither ? 1 : 0, getTPage(0, PSXE_BLEND_HALF, 0, 0));
-        addPrim(psxe_renderer_bucket(renderer, 1), page);
+        addPrim(bucket, page);
         ++renderer->submitted_primitives;
     }
 }
@@ -466,11 +471,16 @@ void psxe_ui_text(psxe_renderer *renderer, int16_t x, int16_t y, const char *tex
         return;
     }
     length = strlen(text);
+    if (length > (SIZE_MAX - sizeof(DR_TPAGE)) / sizeof(SPRT_8)) {
+        ++renderer->dropped_primitives;
+        return;
+    }
     required = (length * sizeof(SPRT_8)) + sizeof(DR_TPAGE);
     start = psxe_renderer_allocate(renderer, required);
     if (start == NULL) {
         return;
     }
     renderer->next_packet = (uint8_t *)FntSort(psxe_renderer_bucket(renderer, 0), start, x, y, text);
-    renderer->submitted_primitives += (uint32_t)length + 1u;
+    size_t glyph_bytes = (size_t)(renderer->next_packet - start) - sizeof(DR_TPAGE);
+    renderer->submitted_primitives += (uint32_t)(glyph_bytes / sizeof(SPRT_8)) + 1u;
 }

@@ -31,6 +31,7 @@ struct psxe_engine {
     psxe_memory_card_config memory_card;
     uint32_t frame;
     uint16_t ticks_per_second;
+    uint16_t cpu_ticks; /* Last frame's input, update and render time, before GPU sync. */
     bool running;
 };
 

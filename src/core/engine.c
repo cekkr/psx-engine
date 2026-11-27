@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "../platform/profile_internal.h"
+
 void psxe_engine_init(psxe_engine *engine, const psxe_engine_config *config) {
     memset(engine, 0, sizeof(*engine));
     engine->memory_card = config->memory_card;
@@ -24,6 +26,10 @@ void psxe_engine_run(psxe_engine *engine, const psxe_game *game) {
     }
 
     while (engine->running) {
+        const bool profile_timing = engine->renderer.profile_timing;
+        if (profile_timing) {
+            psxe_profile_begin();
+        }
         psxe_input_poll(&engine->input);
         if (game->update != NULL) {
             game->update(engine, game->user_data);
@@ -32,6 +38,9 @@ void psxe_engine_run(psxe_engine *engine, const psxe_game *game) {
         psxe_renderer_begin_frame(&engine->renderer);
         if (game->render != NULL) {
             game->render(engine, game->user_data);
+        }
+        if (profile_timing) {
+            engine->cpu_ticks = psxe_profile_end();
         }
         psxe_renderer_end_frame(&engine->renderer);
         ++engine->frame;

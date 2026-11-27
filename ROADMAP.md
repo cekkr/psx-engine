@@ -58,9 +58,9 @@ behavior.
 - [ ] Add a PCSX-Redux smoke harness that boots the sample, waits a bounded
   number of frames, captures serial output/framebuffer, and fails on engine
   assertions or packet overflow.
-- [ ] Add on-screen and serial instrumentation for CPU ticks, GPU sync time,
+- [x] Add on-screen and serial instrumentation for CPU ticks, GPU sync time,
   primitive counts, rejected faces, arena high-water marks, CD reads, VRAM, and
-  SPU allocation.
+  SPU allocation. The debug cube reports these measurements in DuckStation.
 - [ ] Define debug assertions, panic screen, symbol-map workflow, and release
   logging policy.
 - [x] Add host and target checks for compilation, BIN/CUE creation, Markdown

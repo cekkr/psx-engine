@@ -20,6 +20,11 @@ typedef struct psxe_audio {
     uint8_t next_voice;
 } psxe_audio;
 
+typedef struct psxe_audio_stats {
+    uint32_t used_bytes;
+    uint32_t free_bytes;
+} psxe_audio_stats;
+
 void psxe_audio_init(psxe_audio *audio);
 bool psxe_audio_upload_vag(
     psxe_audio *audio,
@@ -40,5 +45,7 @@ int psxe_audio_play(
 );
 void psxe_audio_stop(int voice);
 void psxe_audio_stop_all(void);
+/* SPU sample allocation, including DMA alignment and excluding reserved RAM. */
+psxe_audio_stats psxe_audio_get_stats(const psxe_audio *audio);
 
 #endif

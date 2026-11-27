@@ -226,3 +226,21 @@ bool psxe_vram_free(psxe_vram *vram, psxe_vram_id id) {
     slot->texture.valid = false;
     return true;
 }
+
+psxe_vram_stats psxe_vram_get_stats(const psxe_vram *vram) {
+    psxe_vram_stats stats = { 0 };
+    if ((vram == NULL) || (vram->renderer == NULL)) {
+        return stats;
+    }
+
+    for (size_t row = 0; row < PSXE_ARRAY_COUNT(vram->used_rows); ++row) {
+        uint64_t tiles = vram->used_rows[row];
+        while (tiles) {
+            tiles &= tiles - 1u;
+            ++stats.used_tiles;
+        }
+    }
+    stats.free_tiles = (PSXE_VRAM_WIDTH / PSXE_VRAM_TILE_W) * (PSXE_VRAM_HEIGHT / PSXE_VRAM_TILE_H) -
+                       stats.used_tiles;
+    return stats;
+}

@@ -1,6 +1,7 @@
 psn00bsdk_add_executable(psxe_cube GPREL main.c)
 target_link_libraries(psxe_cube PRIVATE psxe)
 target_compile_options(psxe_cube PRIVATE -Wall -Wextra -Wshadow -Wconversion)
+target_compile_definitions(psxe_cube PRIVATE $<$<CONFIG:Debug>:PSXE_CUBE_DIAGNOSTICS>)
 
 # mkpsxiso puts source modification times in ISO directory records. Normalize
 # the copies used for packaging, keeping source files and the linker output intact.

@@ -163,7 +163,11 @@ typedef struct psxe_render_config {
     psxe_video_mode video_mode;
     psxe_color clear_color;
     bool dither;
+    bool profile_timing; /* Gives the engine exclusive use of hardware timer 2. */
 } psxe_render_config;
+
+/* Timing is measured in CPU clock / 8 ticks. Samples saturate at UINT16_MAX. */
+#define PSXE_PROFILE_TICKS_PER_SECOND 4233600u
 
 typedef struct psxe_render_target_config {
     int16_t x;           /* VRAM position; x and width must be multiples of 16 */
@@ -204,6 +208,10 @@ typedef struct psxe_renderer {
     uint8_t *packet_end;
     uint32_t submitted_primitives;
     uint32_t dropped_primitives;
+    uint32_t rejected_faces;    /* Invalid indices, back-face or depth rejection this frame. */
+    uint32_t packet_bytes;      /* Arena bytes used by the last completed frame. */
+    uint32_t packet_high_water; /* Largest completed frame since initialization. */
+    uint16_t gpu_wait_ticks;    /* Last frame's DrawSync wait, excluding VSync. */
     int active_buffer;
     int depth_shift;
     int16_t width;
@@ -216,6 +224,7 @@ typedef struct psxe_renderer {
     uint32_t lights_folded;     /* beyond three rows, approximated in back color */
     uint32_t lights_dropped;    /* rejected because a light set was full */
     bool dither;
+    bool profile_timing;
     bool frame_open; /* Managed VRAM changes are allowed between frames. */
     /* Current destination ordering table (main buffer or a render target). */
     uint32_t *ordering_table;

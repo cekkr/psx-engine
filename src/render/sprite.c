@@ -106,16 +106,7 @@ static void psxe_sprite_draw_solid(
     bool semitransparent,
     uint8_t blend
 ) {
-    TILE *tile;
-    DR_TPAGE *page = NULL;
-
-    if (semitransparent) {
-        page = psxe_renderer_allocate(renderer, sizeof(*page));
-        if (page == NULL) {
-            return;
-        }
-    }
-    tile = psxe_renderer_allocate(renderer, sizeof(*tile));
+    TILE *tile = psxe_renderer_allocate(renderer, sizeof(*tile) + (semitransparent ? sizeof(DR_TPAGE) : 0u));
     if (tile == NULL) {
         return;
     }
@@ -126,7 +117,8 @@ static void psxe_sprite_draw_solid(
     setSemiTrans(tile, semitransparent ? 1 : 0);
     addPrim(bucket, tile);
     ++renderer->submitted_primitives;
-    if (page != NULL) {
+    if (semitransparent) {
+        DR_TPAGE *page = (DR_TPAGE *)(tile + 1);
         setDrawTPage(page, 0, renderer->dither ? 1 : 0, getTPage(0, blend, 0, 0));
         addPrim(bucket, page);
         ++renderer->submitted_primitives;
@@ -175,11 +167,11 @@ void psxe_sprite_draw(psxe_renderer *renderer, const psxe_sprite *sprite) {
         !(material->effects & (PSXE_EFFECT_FLIP_X | PSXE_EFFECT_FLIP_Y))) {
         /* Unscaled: SPRT is the cheapest textured rectangle, but it samples
          * the GPU's current page, so a DR_TPAGE must execute before it. */
-        SPRT *rect = psxe_renderer_allocate(renderer, sizeof(*rect));
-        DR_TPAGE *page = psxe_renderer_allocate(renderer, sizeof(*page));
-        if ((rect == NULL) || (page == NULL)) {
+        SPRT *rect = psxe_renderer_allocate(renderer, sizeof(*rect) + sizeof(DR_TPAGE));
+        if (rect == NULL) {
             return;
         }
+        DR_TPAGE *page = (DR_TPAGE *)(rect + 1);
         setSprt(rect);
         if (raw_texture) {
             setShadeTex(rect, 1);

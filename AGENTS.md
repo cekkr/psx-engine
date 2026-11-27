@@ -90,8 +90,8 @@ silently simulate faster/slower without an explicit game policy.
   is the only allocator for target GPU packets. It aligns to four bytes, checks
   `packet_end`, and increments `dropped_primitives` on failure. Every draw path
   must handle `NULL`; a path that needs a state packet plus a primitive must
-  reserve both before linking either, so exhaustion drops instead of drawing
-  with the wrong GPU state.
+  reserve both in one allocation. A failed compound draw leaves the packet
+  pointer and ordering table intact and counts one drop.
 - **Ordering-table lifetime:** draw functions add packets only to
   `renderer->ordering_table`/`ot_length`, which is the active buffer's table or,
   during a render-target pass, a table allocated from the active packet arena.
@@ -124,6 +124,12 @@ silently simulate faster/slower without an explicit game policy.
   registers, because those helpers may use GTE registers. Meshes that cannot
   light (`PSXE_EFFECT_UNLIT` or no normals) skip selection and leave the light
   registers stale, which is safe only because no face of theirs is lit.
+- **Timing diagnostics:** `psxe_render_config.profile_timing` gives the engine
+  exclusive use of Timer 2. `psxe_engine_run` times input, update, and render.
+  `psxe_renderer_end_frame` times `DrawSync` before `VSync`. Each interval
+  restarts the clock at CPU clock / 8 with timer IRQs disabled. At
+  `UINT16_MAX`, the interval reached the timer limit. Register access lives in
+  [`src/platform/profile_internal.h`](src/platform/profile_internal.h).
 - **Light selection:** [`src/render/light.c`](src/render/light.c)
   `psxe_light_select` evaluates the renderer set plus borrowed extra lights at
   the mesh origin each draw; it never touches GTE state. Directions point from
@@ -272,7 +278,8 @@ setup, and key on/off.
 
 - **Key functions:** `psxe_audio_upload_vag` validates `VAGp`, big-endian size
   and sample rate, and SPU capacity; `psxe_audio_play` clamps volume/pan and may
-  steal the next voice.
+  steal the next voice. `psxe_audio_get_stats` reports the padded resident sample
+  allocation beginning at the first aligned SPU address, `0x1040`.
 - **Tests:** the cube chime loads and starts a voice in DuckStation. Audible
   capture and hardware tests remain open.
 - **Common mistake:** VAG fields are big-endian and the first 4 KiB of SPU RAM
@@ -318,6 +325,8 @@ at a time. The byte-range reader uses a shared 2048-byte scratch sector for
 partial or unaligned reads. Audio and data share the drive.
 If SDK initialization returns with an outstanding command, `psxe_cd_init`
 retries `CdlInit` with a frame-bounded wait before enabling data callbacks.
+`psxe_cd_sectors_read` samples the IRQ-maintained count of completed data and
+raw sectors. It includes filesystem reads and successful partial transfers.
 
 ### [`src/include/psxe/memory.h`](src/include/psxe/memory.h) and [`src/core/memory.c`](src/core/memory.c)
 
@@ -329,6 +338,7 @@ and the single-allocation `psxe_mesh_storage` view and writable arrays.
 Owns reservations, page-aware placement, sized TIM/CLUT validation, palette
 views, and generation-checked release. Tiles are 16 VRAM halfwords by 8 rows.
 Legacy fixed uploads and render targets require explicit reservations.
+`psxe_vram_get_stats` counts tiles in use, including reservations.
 
 ### [`src/include/psxe/render.h`](src/include/psxe/render.h)
 
@@ -352,7 +362,8 @@ panels, and font sorting.
   (+`DR_TPAGE` for untextured blended faces); `psxe_draw_mesh_material` and
   `psxe_draw_mesh` are the no-extra-lights/`NULL`-material wrappers;
   `psxe_renderer_end_frame` owns synchronization, pass-chain submission, and
-  buffer flip.
+  buffer flip. It records packet bytes and the high-water mark before switching
+  arenas. Face rejection and actual font packet counts feed frame diagnostics.
 - **Tests:** target compilation and cube rendering. Near-plane clipping,
   off-screen clipping, fog, Gouraud shading, target packet stress,
   PAL, and hardware captures are gaps.
@@ -459,7 +470,8 @@ Owns subsystem initialization order and the perpetual update/render loop.
 
 - **Key functions:** `psxe_engine_init` selects 50/60 ticks and initializes
   renderer → input → audio → card; `psxe_engine_run` calls game lifecycle hooks;
-  `psxe_engine_stop` requests exit.
+  `psxe_engine_stop` requests exit. The loop records `cpu_ticks` when timing is
+  enabled.
 - **Common mistake:** shutdown is only reached after `running` becomes false;
   ordinary console games normally keep running forever.
 
@@ -473,6 +485,8 @@ headers to reduce coupling; do not define behavior here.
 Builds the `psxe_cube` PS-X executable, links `psxe`, stages the ISO inputs with
 a fixed UTC timestamp, and registers the ISO image target. Add sample-specific
 embedded assets with PSn00bSDK helpers here.
+Debug configurations enable `PSXE_CUBE_DIAGNOSTICS` for timer sampling and BIOS
+TTY output.
 
 ### [`samples/cube/main.c`](samples/cube/main.c)
 
@@ -485,7 +499,8 @@ object and a scaled/flippable sprite, UI diagnostics, and save/load callbacks.
 - **Key subparts:** `cube_faces` demonstrates winding/normals/materials;
   `game_update` demonstrates edge/held input and synchronous card operations;
   `game_render` demonstrates scene then UI submission; `main` owns region and
-  memory-card identity.
+  memory-card identity. The debug HUD and `update_diagnostics` sample complete
+  frames and resource occupancy once per video second.
 - **Common mistake:** source-defined geometry is only a bootstrap example; new
   content pipelines belong in host cooking tools, not giant production C arrays.
 
@@ -751,6 +766,9 @@ validation remain open.
   the retry loaded the TIM and VAG, started an SPU voice, round-tripped saves
   in both slots, and reported two render-target passes with zero dropped
   primitives at frame 120.
+- Frame diagnostics → the debug cube's HUD and BIOS TTY in DuckStation.
+  A temporary target test covered compound packet exhaustion, exact font
+  packet counts, and timing saturation after two VBlanks inside `update`.
 - Memory-card corruption and version/size checks → host save-format tests.
   Card-full, removal, and physical I/O remain emulator/hardware cases.
 

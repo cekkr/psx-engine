@@ -24,6 +24,7 @@ static psxe_cd_operation psxe_cd_operation_active;
 static psxe_cd_result psxe_cd_read_result = PSXE_CD_INVALID_ARGUMENT;
 static volatile int32_t psxe_cd_pending_sectors;
 static volatile uint32_t psxe_cd_last_sector_tick;
+static volatile uint32_t psxe_cd_completed_sectors;
 static uint32_t *volatile psxe_cd_dma_address;
 static volatile int psxe_cd_sector_words;
 static uint32_t psxe_cd_scratch[PSXE_CD_SECTOR_SIZE / sizeof(uint32_t)];
@@ -45,6 +46,7 @@ static void psxe_cd_sector_interrupt(CdlIntrResult interrupt, uint8_t *result) {
     }
     psxe_cd_dma_address += psxe_cd_sector_words;
     psxe_cd_last_sector_tick = (uint32_t)VSync(-1);
+    ++psxe_cd_completed_sectors;
     --psxe_cd_pending_sectors;
 }
 
@@ -292,6 +294,10 @@ psxe_cd_result psxe_cd_read_cancel(void) {
     psxe_cd_result result = psxe_cd_finish_read(PSXE_CD_OK);
     psxe_cd_read_result = PSXE_CD_INVALID_ARGUMENT;
     return result;
+}
+
+uint32_t psxe_cd_sectors_read(void) {
+    return psxe_cd_completed_sectors;
 }
 
 static psxe_cd_result psxe_cd_read_data(uint32_t lba, uint32_t sectors, void *destination, size_t size) {
